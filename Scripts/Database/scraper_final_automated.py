@@ -207,6 +207,6 @@ def process_blend_files_in_directory(blend_folder, output_directory):
         bpy.ops.wm.read_factory_settings(use_empty=True)
 
 if __name__ == "__main__":
-    blend_folder = bpy.path.abspath("C:/Users/hyperbook/Desktop/PPMGR/Projects")  # Replace with actual path
-    output_directory = bpy.path.abspath("C:/Users/hyperbook/Desktop/PPMGR/Projects/Results")  # Replace with actual path
+    blend_folder = bpy.path.abspath("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Projects")  # Replace with actual path
+    output_directory = bpy.path.abspath("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Projects/Results")  # Replace with actual path
     process_blend_files_in_directory(blend_folder, output_directory)

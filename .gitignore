@@ -65,3 +65,4 @@ dist/
 *.ppt
 *.json
 trained*
+*.pt
