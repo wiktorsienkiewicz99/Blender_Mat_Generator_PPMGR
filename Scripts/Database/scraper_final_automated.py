@@ -2,7 +2,7 @@
 ### Script Summary
 
 This script processes `.blend` files in a specified directory to extract material node and edge data, including ungrouped internal node group data. The results are saved as JSON files for further use.
-
+/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Scripts/Database/run_scraper.sh
 #### Key Components:
 1. **Functions**:
    - **`get_socket_value(socket)`**:
@@ -75,6 +75,22 @@ import bpy
 import json
 import os
 import glob
+import platform
+
+#Check if this works at all
+def load_config(config_file="config.json"):
+    """Loads the configuration and selects paths based on the operating system."""
+    with open(config_file, "r") as file:
+        config = json.load(file)
+
+    system = platform.system()
+    
+    if system == "Windows":
+        return config["win_paths"]
+    elif system == "Darwin":  # macOS
+        return config["mac_paths"]
+    else:
+        raise ValueError("Unsupported operating system: " + system)
 
 def get_socket_value(socket):
     """Get the default value of a socket, if present."""
