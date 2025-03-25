@@ -3,7 +3,7 @@
 # Define paths
 PROJECTS_DIR="/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Projects"
 BLENDER_PATH="/Volumes/ProgramFiles/Apps/Blender_36.app/Contents/MacOS/Blender"
-SCRIPT_PATH="/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Scripts/Database/scraper_final_automated.py"
+SCRIPT_PATH="/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Scripts/Dataset/scraper_final_automated.py"
 
 # Loop through each project folder
 for PROJECT in "$PROJECTS_DIR"/*; do

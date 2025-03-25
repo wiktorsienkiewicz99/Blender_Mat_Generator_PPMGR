@@ -1,5 +1,16 @@
 import os
 import json
+from config_loader import load_config
+
+config = load_config()
+
+# Load paths from configuration file
+dataset_refined_folder = config["dataset_refined_folder_path"]
+dataset_raw_folder = config["dataset_raw_folder_path"]
+
+# Local file path
+merged_dataset_path = dataset_refined_folder + "/merged_dataset.json"
+
 
 def merge_json_files(input_folder, output_file):
     merged_data = {
@@ -33,10 +44,6 @@ def merge_json_files(input_folder, output_file):
     with open(output_file, "w") as output:
         json.dump(merged_data, output, indent=4)
 
-# Define the input folder and output file
-input_folder = r"C:\Users\hyperbook\Desktop\PPMGR\Projects\Results"  # Replace with the path to your folder
-output_file = r"C:\Users\hyperbook\Desktop\PPMGR\Projects\Results\merged_database.json"      # Replace with your desired output file name
+merge_json_files(dataset_raw_folder, merged_dataset_path)
 
-merge_json_files(input_folder, output_file)
-
-print(f"All JSON files from '{input_folder}' have been merged into '{output_file}'.")
+print(f"All JSON files from '{dataset_raw_folder}' have been merged into '{merged_dataset_path}'.")

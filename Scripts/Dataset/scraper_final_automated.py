@@ -74,23 +74,19 @@ This script is especially useful for processing Blender materials into a JSON-ba
 import bpy
 import json
 import os
+import sys
 import glob
-import platform
 
-#Check if this works at all
-def load_config(config_file="config.json"):
-    """Loads the configuration and selects paths based on the operating system."""
-    with open(config_file, "r") as file:
-        config = json.load(file)
+#from config_loader import load_config
 
-    system = platform.system()
-    
-    if system == "Windows":
-        return config["win_paths"]
-    elif system == "Darwin":  # macOS
-        return config["mac_paths"]
-    else:
-        raise ValueError("Unsupported operating system: " + system)
+#config = load_config() # Load configuration
+
+# Load paths from configuration file
+#dataset_raw_folder = config["dataset_raw_folder_path"]
+#project_folder_path = config["project_folder_path"] 
+
+dataset_raw_folder = "/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Raw"
+project_folder_path = "/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Projects"
 
 def get_socket_value(socket):
     """Get the default value of a socket, if present."""
@@ -214,15 +210,13 @@ def process_blend_files_in_directory(blend_folder, output_directory):
     for blend_file in blend_files:
         print(f"Processing {blend_file}...")
         bpy.ops.wm.open_mainfile(filepath=blend_file)
-
         material_data = extract_material_data()
         output_file = os.path.join(output_directory, os.path.basename(blend_file).replace(".blend", "_materials.json"))
-
         save_material_data_to_json(material_data, output_file)
-
         bpy.ops.wm.read_factory_settings(use_empty=True)
 
 if __name__ == "__main__":
-    blend_folder = bpy.path.abspath("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Projects")  # Replace with actual path
-    output_directory = bpy.path.abspath("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Projects/Results")  # Replace with actual path
-    process_blend_files_in_directory(blend_folder, output_directory)
+
+    blender_projects_folder = bpy.path.abspath(project_folder_path)
+    output_directory = bpy.path.abspath(dataset_raw_folder)
+    process_blend_files_in_directory(blender_projects_folder, output_directory)

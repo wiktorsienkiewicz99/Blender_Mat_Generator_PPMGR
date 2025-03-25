@@ -1,13 +1,19 @@
 import json
 import logging
+from config_loader import load_config
+
+config = load_config()
+
+dataset_refined_folder = config["dataset_refined_folder_path"]
+dataset_auxiliary_folder = config["dataset_auxiliary_folder_path"]
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 # Paths
-database_path = r"C:\Users\hyperbook\Desktop\PPMGR\Projects\Results\merged_database.json"
-node_to_id_path = r"C:\Users\hyperbook\Desktop\PPMGR\node_to_id.json"
-id_to_node_path = r"C:\Users\hyperbook\Desktop\PPMGR\id_to_node.json"
+merged_dataset_path = dataset_refined_folder + "/merged_dataset.json"
+node_to_id_path = dataset_auxiliary_folder + "/node_to_id.json"
+id_to_node_path = dataset_auxiliary_folder + "/id_to_node.json"
 
 def generate_node_to_id(input_file, node_to_id_file, id_to_node_file):
     logging.info("Loading training data...")
@@ -41,4 +47,4 @@ def generate_node_to_id(input_file, node_to_id_file, id_to_node_file):
 
 # Run the script
 if __name__ == "__main__":
-    generate_node_to_id(database_path, node_to_id_path, id_to_node_path)
+    generate_node_to_id(merged_dataset_path, node_to_id_path, id_to_node_path)
