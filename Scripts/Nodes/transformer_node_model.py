@@ -109,17 +109,23 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.amp import GradScaler, autocast
 import logging
 import os
+from config_loader import load_config
 
+config = load_config()
+
+dataset_refined_folder = config["dataset_refined_folder_path"]
+dataset_auxiliary_folder = config["dataset_auxiliary_folder_path"]
+models_nodes_folder_path = config["models_nodes_folder_path"]
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 # Paths
-database_path = r"C:\Users\hyperbook\Desktop\PPMGR\Projects\Results\merged_database.json"
-cleaned_data_path = r"C:\Users\hyperbook\Desktop\PPMGR\cleaned_training_data.json"
-model_save_path = r"C:\Users\hyperbook\Desktop\PPMGR\trained_gpt2_model"
-generated_sequence_path = r"C:\Users\hyperbook\Desktop\PPMGR\generated_sequence.txt"
-node_to_id_path = r"C:\Users\hyperbook\Desktop\PPMGR\node_to_id.json"
-id_to_node_path = r"C:\Users\hyperbook\Desktop\PPMGR\id_to_node.json"
+database_path = dataset_refined_folder + "/merged_dataset.json"
+cleaned_data_path = dataset_refined_folder + "/cleaned_training_data.json"
+model_save_path = models_nodes_folder_path
+generated_sequence_path = "/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/test_dump/saved_sequence.txt"
+node_to_id_path = dataset_auxiliary_folder + "/node_to_id.json"
+id_to_node_path = dataset_auxiliary_folder + "/id_to_node.json"
 
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -153,17 +159,19 @@ def generate_node_to_id(input_file, node_to_id_file, id_to_node_file):
     return node_to_id, id_to_node
 
 # Preprocess Dataset Function with IDs
-def preprocess_dataset_with_ids(input_file, output_file, node_to_id):
+def preprocess_dataset_with_ids(input_file, output_file, node_to_id_file):
     logging.info("Loading raw training data...")
     with open(input_file, "r") as file:
         raw_data = json.load(file)
+    with open(node_to_id_file, "r") as file:
+        node_to_id = json.load(file)
 
     logging.info("Converting node types to IDs...")
     preprocessed_data = []
-
-    for material_name, nodes in raw_data.get("nodes", {}).items():
+    for material_name, material_data in raw_data.get("materials", {}).items():
+        nodes = material_data.get("nodes", [])
         node_ids = [node_to_id[node["type"]] for node in nodes if "type" in node and node["type"] in node_to_id]
-        if node_ids:  # Add valid node IDs
+        if node_ids:
             cleaned_sequence = " ".join(map(str, node_ids))
             preprocessed_data.append(cleaned_sequence)
 
@@ -179,11 +187,11 @@ def preprocess_dataset_with_ids(input_file, output_file, node_to_id):
 # Train Model Function
 def train_model():
     # Generate or load node-to-ID mapping
-    node_to_id, id_to_node = generate_node_to_id(database_path, node_to_id_path, id_to_node_path)
+    #node_to_id, id_to_node = generate_node_to_id(database_path, node_to_id_path, id_to_node_path)
 
     # Preprocess the dataset
     try:
-        training_data = preprocess_dataset_with_ids(database_path, cleaned_data_path, node_to_id)
+        training_data = preprocess_dataset_with_ids(database_path, cleaned_data_path, node_to_id_path)
     except ValueError as e:
         logging.error(e)
         return
@@ -260,7 +268,7 @@ def train_model():
     logging.info("Model training and saving completed!")
 
 # Use Model Function
-def use_model(start_sequence="46 25 33"):  # Start with IDs
+def use_model(start_sequence="21 27"):  # Start with IDs
     logging.info("Loading trained model and tokenizer...")
     model = AutoModelForCausalLM.from_pretrained(model_save_path)
     tokenizer = AutoTokenizer.from_pretrained(model_save_path)

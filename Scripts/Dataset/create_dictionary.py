@@ -23,14 +23,13 @@ def generate_node_to_id(input_file, node_to_id_file, id_to_node_file):
     logging.info("Extracting unique node types...")
     node_types = set()
 
-    # Collect all unique node types
-    for material_name, nodes in raw_data.get("nodes", {}).items():
-        for node in nodes:
+    for material_name, material_data in raw_data.get("materials", {}).items():
+        for node in material_data.get("nodes", []):
             if "type" in node:
                 node_types.add(node["type"])
 
     # Create node-to-ID and ID-to-node mappings
-    node_to_id = {node_type: idx + 1 for idx, node_type in enumerate(sorted(node_types))}  # Start IDs from 1
+    node_to_id = {node_type: idx for idx, node_type in enumerate(sorted(node_types))}  # Start ID
     id_to_node = {v: k for k, v in node_to_id.items()}
 
     # Save mappings to JSON files

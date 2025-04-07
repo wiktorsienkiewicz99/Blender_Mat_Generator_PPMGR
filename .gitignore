@@ -66,3 +66,8 @@ dist/
 *.json
 trained*
 *.pt
+Scripts/Dataset/config_loader.py
+Models/Nodes/merges.txt
+*.safetensors
+Scripts/Nodes/config_loader.py
+test_dump/saved_sequence.txt
