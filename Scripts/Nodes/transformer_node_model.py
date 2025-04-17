@@ -319,7 +319,7 @@ def use_model(start_sequence="21 27"):  # Start with IDs
 # Example Usage
 if __name__ == "__main__":
     # Train the model (only run once or when retraining is required)
-    #train_model()
+    train_model()
 
     # Use the trained model to generate a sequence
     use_model()
