@@ -134,3 +134,6 @@ yaml=0.2.5=h1a28f6b_0
 yarl=1.18.0=py312h80987f9_0
 zlib=1.2.13=h18a0788_1
 zstd=1.5.6=hfb09047_0
+
+transformers~=4.51.3
+networkx~=3.4.2
