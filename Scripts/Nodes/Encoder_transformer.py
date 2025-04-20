@@ -202,4 +202,4 @@ if __name__ == "__main__":
     )
 
     # save weights
-    torch.save(model.state_dict(), "edge_generator_mps.pth")
+    torch.save(model.state_dict(), "../Edges/edge_generator_mps.pth")

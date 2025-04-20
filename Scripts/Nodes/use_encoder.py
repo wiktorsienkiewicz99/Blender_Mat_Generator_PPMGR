@@ -94,7 +94,7 @@ def get_slot_memory(graph_index: int) -> torch.Tensor:
 
 if __name__ == "__main__":
     # Config
-    EDGE_MODEL_PATH = "edge_generator_mps.pth"
+    EDGE_MODEL_PATH = "../Edges/edge_generator_mps.pth"
     D_MODEL    = 512
     NHEAD      = 8
     NLAYERS    = 6

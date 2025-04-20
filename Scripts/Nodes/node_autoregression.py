@@ -174,7 +174,7 @@ def sample(args):
 
         tokens = seq.squeeze(1).tolist()
         names = [id2node[str(t)] for t in tokens if 1<=t<=N]
-        print(f"\nSample {i+1}: {' → '.join(names)}")
+        print(f"\nSample {i+1}: {' → '.join(names)}", '\n', tokens)
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
