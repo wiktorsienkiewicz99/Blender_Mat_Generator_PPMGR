@@ -58,7 +58,7 @@ def generate_cleaned_graph_dataset(merged_path, node_to_id_path, socket_to_id_pa
         else:  # Only continue if no break happened (i.e., all node types known)
 
             # Build full node sequence with IDs
-            node_ids = ["<BOS>"] + [node_to_id[t] for t in node_types] + ["<EOS>"]
+            node_ids = [node_to_id[t] for t in node_types]
 
             formatted_edges = []
             for edge in edges:
@@ -97,7 +97,7 @@ def generate_cleaned_graph_dataset(merged_path, node_to_id_path, socket_to_id_pa
     with open(output_path, "w") as f:
         json.dump(samples, f, indent=2)
 
-    logging.info("✅ Cleaned dataset saved successfully!")
+    logging.info("Cleaned dataset saved successfully!")
 
 # Run
 if __name__ == "__main__":

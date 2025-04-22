@@ -6,7 +6,8 @@ python edge_autoregression.py sample \
   --id-to-node-json /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/id_to_node.json \
   --node-type-to-sockets-json /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/node_type_to_sockets.json \
   --vocab-size 128 \
-  --socket-vocab-size 126
+  --socket-vocab-size 126 \
+  --edge-threshold 0.5
 '''
 '''
 python edge_autoregression.py train \
@@ -56,314 +57,177 @@ class EdgeGraphDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        nodes = sample["nodes"]
-        edges = sample["edges"]
-
-        # Filter BOS/EOS and keep only numeric tokens
-        token_ids = [x for x in nodes if isinstance(x, int)]
-        node_tensor = torch.LongTensor(token_ids)
-        edge_tensor = torch.LongTensor(edges) if edges else torch.zeros((0, 4), dtype=torch.long)
-
+        node_tensor = torch.LongTensor(sample["nodes"])
+        edge_tensor = torch.LongTensor(sample["edges"]) if sample["edges"] else torch.zeros((0, 4), dtype=torch.long)
         return node_tensor, edge_tensor
 
-def collate_graphs(batch: List[Tuple[torch.Tensor, torch.Tensor]]):
+def collate_graphs(batch):
     node_seqs = [b[0] for b in batch]
     edge_seqs = [b[1] for b in batch]
     node_lens = torch.LongTensor([len(seq) for seq in node_seqs])
     padded_nodes = nn.utils.rnn.pad_sequence(node_seqs, batch_first=True, padding_value=0)
     return padded_nodes, node_lens, edge_seqs
-
 # ─── Model ───────────────────────────────────────────────────────────────────
 
 class EdgePredictor(nn.Module):
     def __init__(self, vocab_size, socket_vocab_size, d_model, nhead, nlayers, max_nodes):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb   = nn.Embedding(max_nodes, d_model)
-
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=4 * d_model)
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=nlayers)
-
+        self.pos_emb = nn.Embedding(max_nodes, d_model)
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=4 * d_model),
+            num_layers=nlayers
+        )
         self.mlp_edge = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.ReLU(),  # no inplace
+            nn.Linear(2 * d_model, d_model),
+            nn.ReLU(),
             nn.Linear(d_model, 2 * socket_vocab_size)
         )
-
         self.edge_exists = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.ReLU(),  # no inplace
+            nn.Linear(2 * d_model, d_model),
+            nn.ReLU(),
             nn.Linear(d_model, 1)
         )
 
     def forward(self, node_seq):
         B, T = node_seq.shape
-        device = node_seq.device
+        pos = self.pos_emb(torch.arange(T, device=node_seq.device).unsqueeze(0).expand(B, T))
+        h = self.token_emb(node_seq) + pos
+        encoded = self.encoder(h.transpose(0, 1)).transpose(0, 1)  # [B, T, D]
 
-        token = self.token_emb(node_seq)  # [B, T, D]
-        pos_idx = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
-        pos = self.pos_emb(pos_idx)      # [B, T, D]
-
-        h = token + pos                  # [B, T, D]
-
-        h = h.transpose(0, 1)            # [T, B, D]
-        encoded = self.encoder(h).transpose(0, 1)  # [B, T, D]
-
-        node_pairs = []
+        all_pairs = []
         for b in range(B):
             vecs = encoded[b]
             n = (node_seq[b] > 0).sum().item()
-            src_vecs = vecs[:n].unsqueeze(1).repeat(1, n, 1)
-            dst_vecs = vecs[:n].unsqueeze(0).repeat(n, 1, 1)
-            pairs = torch.cat([src_vecs, dst_vecs], dim=2).reshape(n * n, -1)
-            node_pairs.append(pairs)
+            mask = ~torch.eye(n, dtype=torch.bool, device=node_seq.device)
+            src, dst = mask.nonzero(as_tuple=True)
+            pair_vecs = torch.cat([vecs[src], vecs[dst]], dim=1)
+            all_pairs.append(pair_vecs)
 
-        x = torch.cat(node_pairs, dim=0)               # [total_pairs, 2D]
-        edge_logits = self.mlp_edge(x)                 # [total_pairs, 2 * socket_vocab]
-        exist_logits = self.edge_exists(x).squeeze(1)  # [total_pairs]
-
-        return edge_logits, exist_logits, node_pairs
+        x = torch.cat(all_pairs, dim=0)
+        return self.mlp_edge(x), self.edge_exists(x).squeeze(1)
 
 # ─── Training ────────────────────────────────────────────────────────────────
 def train(args):
-    import torch
+    import json, torch
     from torch.utils.data import Subset
-    import torch.nn.functional as F
+    from torch.nn import functional as F
     from tqdm import tqdm
-    import json
 
-    torch.autograd.set_detect_anomaly(True)
-    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-    print("Training on", device)
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
 
-
+    # Load everything
+    with open(args.data_json) as f: data = json.load(f)
+    with open(args.id_to_socket_json) as f: socket_to_id = {v: int(k) for k, v in json.load(f).items()}
+    with open(args.id_to_node_json) as f: id_to_node = {int(k): v for k, v in json.load(f).items()}
+    with open(args.node_type_to_sockets_json) as f: node_type_to_sockets = json.load(f)
 
     dataset = EdgeGraphDataset(args.data_json)
-
-    # 🚀 Apply sample limit for faster debugging
-    if args.limit_samples is not None:
-        print(f"⚡ Limiting training to {args.limit_samples} samples")
-        dataset = Subset(dataset, list(range(args.limit_samples)))
-
+    if args.limit_samples:
+        dataset = Subset(dataset, range(args.limit_samples))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_graphs)
 
-    with open(args.id_to_socket_json, "r") as f:
-        id_to_socket = {int(k): v for k, v in json.load(f).items()}
-        socket_to_id = {v: k for k, v in id_to_socket.items()}
-
-    with open(args.id_to_node_json, "r") as f:
-        id_to_node = {int(k): v for k, v in json.load(f).items()}
-
-    with open(args.node_type_to_sockets_json, "r") as f:
-        node_type_to_sockets = json.load(f)
-
-    model = EdgePredictor(
-        vocab_size=args.vocab_size,
-        socket_vocab_size=args.socket_vocab_size,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        nlayers=args.nlayers,
-        max_nodes=args.max_nodes
-    ).to(device)
-
+    model = EdgePredictor(args.vocab_size, args.socket_vocab_size, args.d_model,
+                          args.nhead, args.nlayers, args.max_nodes).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(args.epochs):
         model.train()
-        total_loss = 0
-        total_graphs = 0
+        total_loss, total_graphs = 0, 0
+        for nodes, lens, edges in tqdm(loader, desc=f"Epoch {epoch+1}"):
+            nodes = nodes.to(device)
+            edge_logits, exist_logits = model(nodes)
 
-        for batch_nodes, lengths, batch_edges in tqdm(loader, desc=f"Epoch {epoch}"):
-            batch_nodes = batch_nodes.to(device)
-            edge_logits, exist_logits, _ = model(batch_nodes)
+            idx_offset = 0
+            loss_list = []
+            for b in range(len(edges)):
+                n = lens[b].item()
+                true_edges = edges[b].to(device)
+                pair_count = n * (n - 1)
+                if pair_count == 0: continue
 
-            edge_idx = 0
-            loss_accumulator = []
-            valid_graphs = 0
+                pred_edges = edge_logits[idx_offset:idx_offset+pair_count]
+                pred_exist = exist_logits[idx_offset:idx_offset+pair_count]
+                idx_offset += pair_count
 
-            for b in range(len(batch_edges)):
-                edges = batch_edges[b]
-                n = lengths[b].item()
+                labels = torch.full((pair_count, 2), -100, dtype=torch.long, device=device)
+                exists = torch.zeros(pair_count, device=device)
+                for src, src_sock, dst, dst_sock in true_edges:
+                    if src == dst or src >= n or dst >= n: continue
+                    flat_idx = src * (n - 1) + dst - (1 if dst > src else 0)
+                    labels[flat_idx] = torch.tensor([src_sock, dst_sock])
+                    exists[flat_idx] = 1.0
 
-                preds = edge_logits[edge_idx:]
-                exist_pred = exist_logits[edge_idx:]
+                valid = labels[:, 0] != -100
+                if valid.sum() == 0: continue
 
-                expected_pairs = n * n
-                available_pairs = preds.shape[0]
-                actual_pairs = min(expected_pairs, available_pairs)
+                from_logits, to_logits = pred_edges[:, :args.socket_vocab_size], pred_edges[:, args.socket_vocab_size:]
 
-                if actual_pairs == 0:
-                    continue
+                # Optional socket masking could be re-added here
 
-                preds = preds[:actual_pairs]
-                exist_pred = exist_pred[:actual_pairs]
-                edge_idx += actual_pairs
+                from_loss = F.cross_entropy(from_logits[valid], labels[valid, 0])
+                to_loss = F.cross_entropy(to_logits[valid], labels[valid, 1])
+                exist_loss = F.binary_cross_entropy_with_logits(pred_exist, exists)
+                loss = from_loss + to_loss + exist_loss
 
-                labels = torch.full((actual_pairs, 2), -100, dtype=torch.long, device=device)
-                exist_labels = torch.zeros(actual_pairs, dtype=torch.float32, device=device)
+                loss_list.append(loss)
 
-                for edge in edges:
-                    src, src_sock, dst, dst_sock = edge.tolist()
-                    if src >= n or dst >= n:
-                        continue
-                    idx = src * n + dst
-                    if idx >= actual_pairs:
-                        continue
-                    labels[idx] = torch.tensor([src_sock, dst_sock], device=device)
-                    exist_labels[idx] = 1.0
-
-                mask = labels[:, 0] != -100
-                if mask.sum() == 0:
-                    continue
-
-                from_logits_raw = preds[:, :args.socket_vocab_size]
-                to_logits_raw   = preds[:, args.socket_vocab_size:]
-
-                from_logits = from_logits_raw.clone()
-                to_logits = to_logits_raw.clone()
-
-                # 🔒 Apply socket masking per pair
-                for idx in range(actual_pairs):
-                    src = idx // n
-                    dst = idx % n
-
-                    if labels[idx, 0] == -100:
-                        continue
-
-                    src_node_id = batch_nodes[b][src].item()
-                    dst_node_id = batch_nodes[b][dst].item()
-                    src_type = id_to_node.get(src_node_id, None)
-                    dst_type = id_to_node.get(dst_node_id, None)
-
-                    if not src_type or not dst_type:
-                        continue
-
-                    valid_from_names = node_type_to_sockets.get(src_type, {}).get("outputs", [])
-                    valid_to_names   = node_type_to_sockets.get(dst_type, {}).get("inputs", [])
-
-                    valid_from_ids = set(socket_to_id[s] for s in valid_from_names if s in socket_to_id)
-                    valid_to_ids   = set(socket_to_id[s] for s in valid_to_names if s in socket_to_id)
-
-                    from_mask = torch.ones(args.socket_vocab_size, device=device) * -1e9
-                    to_mask   = torch.ones(args.socket_vocab_size, device=device) * -1e9
-
-                    for fid in valid_from_ids:
-                        from_mask[fid] = 0
-                    for tid in valid_to_ids:
-                        to_mask[tid] = 0
-
-                    from_logits[idx] += from_mask
-                    to_logits[idx] += to_mask
-
-                from_loss = F.cross_entropy(from_logits[mask], labels[mask, 0])
-                to_loss   = F.cross_entropy(to_logits[mask], labels[mask, 1])
-                exist_loss = F.binary_cross_entropy_with_logits(exist_pred, exist_labels)
-
-                total_graph_loss = from_loss + to_loss + exist_loss
-                loss_accumulator.append(total_graph_loss)
-                valid_graphs += 1
-
-            if valid_graphs > 0:
-                batch_total_loss = torch.stack(loss_accumulator).mean()
+            if loss_list:
+                batch_loss = torch.stack(loss_list).mean()
                 opt.zero_grad()
-                batch_total_loss.backward()
+                batch_loss.backward()
                 opt.step()
-
-                print(f"from_logits[mask]: {from_logits[mask][:3].tolist()}")
-                print(f"labels[mask, 0]: {labels[mask, 0][:3].tolist()}")
-
-                print("from_logits shape:", from_logits.shape)
-                print("labels shape:", labels.shape)
-
-                total_loss += batch_total_loss.item()
+                total_loss += batch_loss.item()
                 total_graphs += 1
-            print(
-                f"[Graph {b}] from_loss={from_loss.item():.2f}, to_loss={to_loss.item():.2f}, exist_loss={exist_loss.item():.2f}")
 
-        print(f"Epoch {epoch} avg loss: {total_loss / max(total_graphs, 1):.4f}")
+        print(f"Epoch {epoch+1} avg loss: {total_loss / max(1, total_graphs):.4f}")
 
     torch.save(model.state_dict(), args.model_out)
-    print("✅ Model saved to:", args.model_out)
+    print("Model saved:", args.model_out)
 
 # ─── Sampling ────────────────────────────────────────────────────────────────
-
 def sample(args):
-    import torch.nn.functional as F
-    import json
-    from pathlib import Path
+    import json, torch
+    from torch.nn.functional import sigmoid
 
-    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-    print("Sampling on", device)
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load mappings
-    with open(args.socket_id_to_name_json, "r") as f:
-        id_to_socket = {int(k): v for k, v in json.load(f).items()}
-    with open(args.id_to_node_json, "r") as f:
-        id_to_node = {int(k): v for k, v in json.load(f).items()}
-    with open(args.node_type_to_sockets_json, "r") as f:
-        node_type_to_sockets = json.load(f)
+    with open(args.socket_id_to_name_json) as f: id_to_socket = {int(k): v for k, v in json.load(f).items()}
+    with open(args.id_to_node_json) as f: id_to_node = {int(k): v for k, v in json.load(f).items()}
+    with open(args.node_type_to_sockets_json) as f: node_type_to_sockets = json.load(f)
 
-    # Load model
-    model = EdgePredictor(
-        vocab_size=args.vocab_size,
-        socket_vocab_size=args.socket_vocab_size,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        nlayers=args.nlayers,
-        max_nodes=args.max_nodes
-    ).to(device)
-
-    state = torch.load(args.model_in, map_location="cpu")
-    model.load_state_dict(state)
+    model = EdgePredictor(args.vocab_size, args.socket_vocab_size, args.d_model,
+                          args.nhead, args.nlayers, args.max_nodes).to(device)
+    model.load_state_dict(torch.load(args.model_in, map_location=device))
     model.eval()
 
-    # Prepare input
     node_seq = [int(x) for x in args.node_sequence.strip().split()]
     node_tensor = torch.LongTensor(node_seq).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        edge_logits, exist_logits, _ = model(node_tensor)
-
-    from_sockets = torch.argmax(edge_logits[:, :args.socket_vocab_size], dim=1)
-    to_sockets   = torch.argmax(edge_logits[:, args.socket_vocab_size:], dim=1)
-    edge_probs   = torch.sigmoid(exist_logits)
+        edge_logits, exist_logits = model(node_tensor)
 
     n = len(node_seq)
-    index = 0
+    from_socks = torch.argmax(edge_logits[:, :args.socket_vocab_size], dim=1)
+    to_socks = torch.argmax(edge_logits[:, args.socket_vocab_size:], dim=1)
+    probs = sigmoid(exist_logits)
+
     print("\nPredicted Edges:")
+    index = 0
     for i in range(n):
         for j in range(n):
-            if i == j:
+            if i == j: continue
+            if probs[index].item() < args.edge_threshold:
                 index += 1
                 continue
 
-            # Filter based on binary edge prediction
-            if edge_probs[index].item() < args.edge_threshold:
-                index += 1
-                continue
-
-            # Socket IDs
-            fs_id = from_sockets[index].item()
-            ts_id = to_sockets[index].item()
-            fs = id_to_socket.get(fs_id, "<?>")
-            ts = id_to_socket.get(ts_id, "<?>")
-
-            # Node types
-            src_type = id_to_node.get(node_seq[i], f"Node{i}")
-            dst_type = id_to_node.get(node_seq[j], f"Node{j}")
-            src_outputs = node_type_to_sockets.get(src_type, {}).get("outputs", [])
-            dst_inputs  = node_type_to_sockets.get(dst_type, {}).get("inputs", [])
-
-            # Validate socket names
-            valid_from = fs in src_outputs
-            valid_to   = ts in dst_inputs
-            fs_display = fs if valid_from else "<?>"
-            ts_display = ts if valid_to else "<?>"
-
-            print(f"{src_type} --[{fs_display}]--> {dst_type} --[{ts_display}]")
+            fs_id, ts_id = from_socks[index].item(), to_socks[index].item()
+            fs, ts = id_to_socket.get(fs_id, "<?>"), id_to_socket.get(ts_id, "<?>")
+            src_type, dst_type = id_to_node.get(node_seq[i], f"Node{i}"), id_to_node.get(node_seq[j], f"Node{j}")
+            valid_from = fs in node_type_to_sockets.get(src_type, {}).get("outputs", [])
+            valid_to = ts in node_type_to_sockets.get(dst_type, {}).get("inputs", [])
+            print(f"{src_type} --[{fs if valid_from else '<?>'}]--> {dst_type} --[{ts if valid_to else '<?>'}]")
             index += 1
-
-
 
 def validate_edges(dataset_path, id_to_node_path, id_to_socket_path, node_type_to_sockets_path):
     import json
