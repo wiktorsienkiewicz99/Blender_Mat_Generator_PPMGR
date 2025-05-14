@@ -6,8 +6,10 @@ python edge_autoregression.py sample \
   --id-to-node-json /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/id_to_node.json \
   --node-type-to-sockets-json /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/node_type_to_sockets.json \
   --vocab-size 128 \
-  --socket-vocab-size 126 \
-  --edge-threshold 0.5
+  --max-nodes 256 \
+  --socket-vocab-size 128 \
+  --edge-threshold 0.01
+
 '''
 '''
 python edge_autoregression.py train \
@@ -17,9 +19,15 @@ python edge_autoregression.py train \
   --id-to-node-json /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/id_to_node.json \
   --node-type-to-sockets-json /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/node_type_to_sockets.json \
   --vocab-size 128 \
-  --socket-vocab-size 126 \
+  --socket-vocab-size 128 \
   --limit-samples 2000 \
-  --epochs 1
+  --batch-size 8 \
+  --nhead 4 \
+  --nlayers 4 \
+  --d-model 256 \
+  --lr 1e-4 \
+  --max-nodes 256 \
+  --epochs 5
 '''
 '''
 python edge_autoregression.py validate \
@@ -108,6 +116,8 @@ class EdgePredictor(nn.Module):
         return self.mlp_edge(x), self.edge_exists(x).squeeze(1)
 
 # ─── Training ────────────────────────────────────────────────────────────────
+# Updated train() to derive socket mappings from dataset instead of node_type_to_sockets.json
+
 def train(args):
     import json, torch
     from torch.utils.data import Subset
@@ -118,9 +128,20 @@ def train(args):
 
     # Load everything
     with open(args.data_json) as f: data = json.load(f)
-    with open(args.id_to_socket_json) as f: socket_to_id = {v: int(k) for k, v in json.load(f).items()}
+    with open(args.id_to_socket_json) as f: id_to_socket = {int(k): v for k, v in json.load(f).items()}
     with open(args.id_to_node_json) as f: id_to_node = {int(k): v for k, v in json.load(f).items()}
-    with open(args.node_type_to_sockets_json) as f: node_type_to_sockets = json.load(f)
+
+    # Build socket-per-type dictionaries from dataset
+    output_sockets = {}
+    input_sockets = {}
+    for sample in data:
+        node_types = sample["node_types"]
+        for src, src_sock, dst, dst_sock in sample["edges"]:
+            if src < len(node_types) and dst < len(node_types):
+                src_type = node_types[src]
+                dst_type = node_types[dst]
+                output_sockets.setdefault(src_type, set()).add(src_sock)
+                input_sockets.setdefault(dst_type, set()).add(dst_sock)
 
     dataset = EdgeGraphDataset(args.data_json)
     if args.limit_samples:
@@ -152,24 +173,41 @@ def train(args):
 
                 labels = torch.full((pair_count, 2), -100, dtype=torch.long, device=device)
                 exists = torch.zeros(pair_count, device=device)
-                for src, src_sock, dst, dst_sock in true_edges:
-                    if src == dst or src >= n or dst >= n: continue
+
+                node_ids = nodes[b][:n].tolist()
+                node_types = [id_to_node.get(i, None) for i in node_ids]
+
+                for src, src_sock, dst, dst_sock in true_edges.tolist():
+                    if src == dst or src >= n or dst >= n:
+                        continue
+
+                    src_type = node_types[src]
+                    dst_type = node_types[dst]
+
+                    if not src_type or not dst_type:
+                        continue
+
+                    valid_src = src_sock in output_sockets.get(src_type, set())
+                    valid_dst = dst_sock in input_sockets.get(dst_type, set())
+
+                    if not (valid_src and valid_dst):
+                        continue
+
                     flat_idx = src * (n - 1) + dst - (1 if dst > src else 0)
-                    labels[flat_idx] = torch.tensor([src_sock, dst_sock])
+                    labels[flat_idx] = torch.tensor([src_sock, dst_sock], device=device)
                     exists[flat_idx] = 1.0
 
                 valid = labels[:, 0] != -100
                 if valid.sum() == 0: continue
 
-                from_logits, to_logits = pred_edges[:, :args.socket_vocab_size], pred_edges[:, args.socket_vocab_size:]
+                from_logits = pred_edges[:, :args.socket_vocab_size]
+                to_logits = pred_edges[:, args.socket_vocab_size:]
 
-                # Optional socket masking could be re-added here
-
-                from_loss = F.cross_entropy(from_logits[valid], labels[valid, 0])
-                to_loss = F.cross_entropy(to_logits[valid], labels[valid, 1])
+                from_loss = F.cross_entropy(from_logits, labels[:, 0], ignore_index=-100)
+                to_loss = F.cross_entropy(to_logits, labels[:, 1], ignore_index=-100)
                 exist_loss = F.binary_cross_entropy_with_logits(pred_exist, exists)
-                loss = from_loss + to_loss + exist_loss
 
+                loss = from_loss + to_loss + exist_loss
                 loss_list.append(loss)
 
             if loss_list:
@@ -186,15 +224,39 @@ def train(args):
     print("Model saved:", args.model_out)
 
 # ─── Sampling ────────────────────────────────────────────────────────────────
+# Sample function with filtered fallback socket prediction
+
 def sample(args):
     import json, torch
     from torch.nn.functional import sigmoid
+    from collections import defaultdict, Counter
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
 
     with open(args.socket_id_to_name_json) as f: id_to_socket = {int(k): v for k, v in json.load(f).items()}
     with open(args.id_to_node_json) as f: id_to_node = {int(k): v for k, v in json.load(f).items()}
     with open(args.node_type_to_sockets_json) as f: node_type_to_sockets = json.load(f)
+    with open("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Refined/cleaned_graph_dataset.json") as f: dataset = json.load(f)
+
+    # Build co-occurrence table from dataset
+    pair_counts = defaultdict(Counter)
+    total_counts = defaultdict(int)
+    for sample in dataset:
+        node_types = sample["node_types"]
+        for src, src_sock, dst, dst_sock in sample["edges"]:
+            if src >= len(node_types) or dst >= len(node_types):
+                continue
+            src_type = node_types[src]
+            dst_type = node_types[dst]
+            key = (src_sock, dst_type)
+            pair_counts[key][dst_sock] += 1
+            total_counts[key] += 1
+
+    co_occurrence_probabilities = {}
+    for key, counter in pair_counts.items():
+        total = total_counts[key]
+        sorted_probs = sorted(((dst_sock, count / total) for dst_sock, count in counter.items()), key=lambda x: -x[1])
+        co_occurrence_probabilities[key] = sorted_probs
 
     model = EdgePredictor(args.vocab_size, args.socket_vocab_size, args.d_model,
                           args.nhead, args.nlayers, args.max_nodes).to(device)
@@ -221,12 +283,31 @@ def sample(args):
                 index += 1
                 continue
 
-            fs_id, ts_id = from_socks[index].item(), to_socks[index].item()
-            fs, ts = id_to_socket.get(fs_id, "<?>"), id_to_socket.get(ts_id, "<?>")
-            src_type, dst_type = id_to_node.get(node_seq[i], f"Node{i}"), id_to_node.get(node_seq[j], f"Node{j}")
+            fs_id = from_socks[index].item()
+            ts_id = to_socks[index].item()
+
+            fs = id_to_socket.get(fs_id, "<?>")
+            ts = id_to_socket.get(ts_id, "<?>")
+
+            src_type = id_to_node.get(node_seq[i], f"Node{i}")
+            dst_type = id_to_node.get(node_seq[j], f"Node{j}")
+
             valid_from = fs in node_type_to_sockets.get(src_type, {}).get("outputs", [])
             valid_to = ts in node_type_to_sockets.get(dst_type, {}).get("inputs", [])
-            print(f"{src_type} --[{fs if valid_from else '<?>'}]--> {dst_type} --[{ts if valid_to else '<?>'}]")
+
+            # fallback if to_socket is invalid
+            if not valid_to:
+                fallback = co_occurrence_probabilities.get((fs_id, dst_type))
+                if fallback:
+                    for fallback_ts_id, _ in fallback:
+                        fallback_ts = id_to_socket.get(fallback_ts_id, "<?>")
+                        if fallback_ts in node_type_to_sockets.get(dst_type, {}).get("inputs", []):
+                            ts_id = fallback_ts_id
+                            ts = fallback_ts
+                            valid_to = True
+                            break
+
+            print(f"{src_type} --[{fs_id}:{fs if valid_from else '<?>'}]--> {dst_type} --[{ts_id}:{ts if valid_to else '<?>'}]")
             index += 1
 
 def validate_edges(dataset_path, id_to_node_path, id_to_socket_path, node_type_to_sockets_path):
@@ -247,8 +328,8 @@ def validate_edges(dataset_path, id_to_node_path, id_to_socket_path, node_type_t
     with open(node_type_to_sockets_path) as f:
         node_type_to_sockets = json.load(f)
 
-    print("✅ Loaded all dictionaries.")
-    print(f"🔍 Checking {len(dataset)} materials...")
+    print("Loaded all dictionaries.")
+    print(f"Checking {len(dataset)} materials...")
 
     error_count = 0
 
@@ -262,7 +343,7 @@ def validate_edges(dataset_path, id_to_node_path, id_to_socket_path, node_type_t
 
             # Check if indices are in range
             if from_node_idx >= len(node_types) or to_node_idx >= len(node_types):
-                print(f"❌ [{material_name}] Edge with invalid node index: {edge}")
+                print(f"[{material_name}] Edge with invalid node index: {edge}")
                 error_count += 1
                 continue
 
@@ -276,16 +357,16 @@ def validate_edges(dataset_path, id_to_node_path, id_to_socket_path, node_type_t
             to_inputs    = node_type_to_sockets.get(to_type, {}).get("inputs", [])
 
             if from_socket_name not in from_outputs:
-                print(f"⚠️  [{material_name}] {from_type} has no output '{from_socket_name}' (ID {from_socket_id})")
+                print(f"[{material_name}] {from_type} has no output '{from_socket_name}' (ID {from_socket_id})")
                 error_count += 1
 
             if to_socket_name not in to_inputs:
-                print(f"⚠️  [{material_name}] {to_type} has no input '{to_socket_name}' (ID {to_socket_id})")
+                print(f"[{material_name}] {to_type} has no input '{to_socket_name}' (ID {to_socket_id})")
                 error_count += 1
 
-    print(f"\n🔎 Validation complete. Found {error_count} socket issues.")
+    print(f"\n Validation complete. Found {error_count} socket issues.")
     if error_count == 0:
-        print("🎉 Dataset is clean!")
+        print(" Dataset is clean!")
 
 # CLI
 if __name__ == "__main__":

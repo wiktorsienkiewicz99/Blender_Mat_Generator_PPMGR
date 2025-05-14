@@ -76,3 +76,4 @@ test_dump/saved_sequence.txt
 *.log
 .DS_Store
 *.pth
+.DS_Store
