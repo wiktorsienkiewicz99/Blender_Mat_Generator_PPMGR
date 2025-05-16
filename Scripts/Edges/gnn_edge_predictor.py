@@ -1,3 +1,8 @@
+"""
+GraphEdge Prediction with Socket Classification for Blender-style Material Graphs
+Uses GCN layers and edge features (node type pair + distance) to learn realistic edge formation.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,10 +13,31 @@ from torch.utils.data import random_split
 import json
 import random
 
-# Load node/socket mapping
-with open("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/id_to_node.json", "r") as f:
+# ──────────────────────────────────────────────────────
+# CONFIGURATION
+# ──────────────────────────────────────────────────────
+DATA_PATH = "/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Refined/cleaned_graph_dataset.json"
+NODE_MAP_PATH = "/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/id_to_node.json"
+SOCKET_MAP_PATH = "/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/id_to_socket.json"
+
+HIDDEN_DIM = 64
+BATCH_SIZE = 64
+NUM_WORKERS = 4
+NUM_NEGATIVES = 10
+LEARNING_RATE = 0.001
+WEIGHT_DECAY = 1e-5
+POS_WEIGHT = 5.0
+PATIENCE = 10
+MAX_EPOCHS = 100
+STEP_SIZE = 10
+GAMMA = 0.9
+
+# ──────────────────────────────────────────────────────
+# MAPPINGS
+# ──────────────────────────────────────────────────────
+with open(NODE_MAP_PATH, "r") as f:
     id_to_node = json.load(f)
-with open("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/id_to_socket.json", "r") as f:
+with open(SOCKET_MAP_PATH, "r") as f:
     id_to_socket = json.load(f)
 
 NUM_NODE_TYPES = len(id_to_node)
@@ -21,7 +47,8 @@ NUM_SOCKET_TYPES = len(id_to_socket)
 # DATASET
 # ──────────────────────────────────────────────────────
 class GraphEdgeDataset(Dataset):
-    def __init__(self, path: str, num_negatives: int = 10):
+    """Dataset for loading material graphs and generating positive/negative edge samples."""
+    def __init__(self, path: str, num_negatives: int = NUM_NEGATIVES):
         super().__init__()
         with open(path, 'r') as f:
             all_graphs = json.load(f)
@@ -43,12 +70,8 @@ class GraphEdgeDataset(Dataset):
             if src in id_to_local and dst in id_to_local
         )
 
-        edge_index = []
-        edge_attr = []
-        edge_exists = []
-        socket_mask = []
-        edge_type_pair = []
-        edge_distance = []
+        edge_index, edge_attr, edge_exists = [], [], []
+        socket_mask, edge_type_pair, edge_distance = [], [], []
 
         for src, src_sock, dst, dst_sock in g["edges"]:
             if src in id_to_local and dst in id_to_local:
@@ -71,19 +94,21 @@ class GraphEdgeDataset(Dataset):
             edge_type_pair.append([node_types[src].item(), node_types[dst].item()])
             edge_distance.append(abs(src - dst))
 
-        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-        edge_attr = torch.tensor(edge_attr, dtype=torch.long)
-        edge_exists = torch.tensor(edge_exists, dtype=torch.float32)
-        socket_mask = torch.tensor(socket_mask, dtype=torch.float32)
-        edge_type_pair = torch.tensor(edge_type_pair, dtype=torch.long)
-        edge_distance = torch.tensor(edge_distance, dtype=torch.float32).unsqueeze(-1)
+        return Data(
+            x=x,
+            edge_index=torch.tensor(edge_index, dtype=torch.long).t().contiguous(),
+            edge_attr=torch.tensor(edge_attr, dtype=torch.long),
+            edge_exists=torch.tensor(edge_exists, dtype=torch.float32),
+            socket_mask=torch.tensor(socket_mask, dtype=torch.float32),
+            edge_type_pair=torch.tensor(edge_type_pair, dtype=torch.long),
+            edge_distance=torch.tensor(edge_distance, dtype=torch.float32).unsqueeze(-1)
+        )
 
-        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, edge_exists=edge_exists,
-                    socket_mask=socket_mask, edge_type_pair=edge_type_pair, edge_distance=edge_distance)
 # ──────────────────────────────────────────────────────
 # MODEL
 # ──────────────────────────────────────────────────────
 class GNNModel(nn.Module):
+    """Graph Convolutional Network with edge feature conditioning."""
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
         self.gcn1 = GCNConv(input_dim, hidden_dim)
@@ -105,22 +130,11 @@ class GNNModel(nn.Module):
             nn.Linear(hidden_dim, 2 * NUM_SOCKET_TYPES)
         )
 
-        nn.init.xavier_uniform_(self.edge_classifier.weight)
-        self.edge_classifier.bias.data.fill_(0.0)
-        nn.init.xavier_uniform_(self.socket_predictor[0].weight)
-        self.socket_predictor[0].bias.data.fill_(0.0)
-
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-        x = self.gcn1(x, edge_index)
-        x = self.norm1(x).relu()
-        x = self.dropout(x)
-        x = self.gcn2(x, edge_index)
-        x = self.norm2(x).relu()
-        x = self.dropout(x)
-        x = self.gcn3(x, edge_index)
-        x = self.norm3(x).relu()
-        x = self.dropout(x)
+        x = self.dropout(self.norm1(self.gcn1(x, edge_index)).relu())
+        x = self.dropout(self.norm2(self.gcn2(x, edge_index)).relu())
+        x = self.dropout(self.norm3(self.gcn3(x, edge_index)).relu())
 
         src_nodes = edge_index[0]
         dst_nodes = edge_index[1]
@@ -129,15 +143,14 @@ class GNNModel(nn.Module):
         type_pair_ids = data.edge_type_pair[:, 0] * NUM_NODE_TYPES + data.edge_type_pair[:, 1]
         type_embed = self.type_embedding(type_pair_ids)
         dist_embed = self.distance_embedding(data.edge_distance)
-
         edge_input = torch.cat([edge_reps, type_embed, dist_embed], dim=1)
 
         edge_exists = self.edge_classifier(edge_input).squeeze(-1)
         socket_logits = self.socket_predictor(edge_input)
-
         return edge_exists, socket_logits
+
 # ──────────────────────────────────────────────────────
-# TRAINING
+# TRAINING FUNCTION
 # ──────────────────────────────────────────────────────
 def train(model, loader, optimizer, bce_loss, ce_loss, device):
     model.train()
@@ -169,14 +182,12 @@ def train(model, loader, optimizer, bce_loss, ce_loss, device):
     return total_loss / len(loader)
 
 # ──────────────────────────────────────────────────────
-# TESTING
+# TESTING FUNCTION
 # ──────────────────────────────────────────────────────
 def test(model, loader, device):
     model.eval()
-    correct = 0
-    total = 0
-    sock_correct = 0
-    sock_total = 0
+    correct, total = 0, 0
+    sock_correct, sock_total = 0, 0
     with torch.no_grad():
         for data in loader:
             data = data.to(device)
@@ -209,25 +220,24 @@ def main():
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     torch.manual_seed(42)
 
-    dataset = GraphEdgeDataset("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Refined/cleaned_graph_dataset.json")
+    dataset = GraphEdgeDataset(DATA_PATH)
     train_len = int(0.8 * len(dataset))
     test_len = len(dataset) - train_len
     train_dataset, test_dataset = random_split(dataset, [train_len, test_len])
 
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=64, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
 
-    model = GNNModel(input_dim=NUM_NODE_TYPES, hidden_dim=64).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(5.0, device=device))
+    model = GNNModel(input_dim=NUM_NODE_TYPES, hidden_dim=HIDDEN_DIM).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(POS_WEIGHT, device=device))
     ce = nn.CrossEntropyLoss()
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=STEP_SIZE, gamma=GAMMA)
 
     best_socket_acc = 0.0
-    patience = 10
     streak = 0
 
-    for epoch in range(1, 101):
+    for epoch in range(1, MAX_EPOCHS + 1):
         loss = train(model, train_loader, optimizer, bce, ce, device)
         edge_acc, sock_acc = test(model, test_loader, device)
         print(f"Epoch {epoch:02d} - Loss: {loss:.4f} - Edge Acc: {edge_acc:.4f} - Socket Acc: {sock_acc:.4f}")
@@ -235,10 +245,10 @@ def main():
         if sock_acc > best_socket_acc:
             best_socket_acc = sock_acc
             streak = 0
-            torch.save(model.state_dict(), "gnn_edge_model.pt")
+            torch.save(model.state_dict(), "test_gnn_edge_model.pt")
         else:
             streak += 1
-            if streak >= patience:
+            if streak >= PATIENCE:
                 print(f"Early stopping at epoch {epoch}")
                 break
         scheduler.step()
