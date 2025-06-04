@@ -137,3 +137,9 @@ zstd=1.5.6=hfb09047_0
 
 transformers~=4.51.3
 networkx~=3.4.2
+torch-geometric~=2.6.1
+tqdm~=4.67.1
+scikit-learn~=1.6.1
+tokenizers~=0.21.0
+diffusers~=0.32.2
+pillow~=11.1.0
