@@ -19,7 +19,8 @@ MODEL_PATH = "gnn_edge_model.pt"
 THRESHOLD = 0.95
 
 # Example node type sequence for sampling
-sequence = [58, 58, 58, 33, 56, 58, 43, 9, 23, 48, 41, 58, 17, 35]
+sequence = [33, 56, 43, 58, 58, 58, 9, 23, 41, 48, 35, 58, 17]
+
 
 # ──────────────────────────────────────────────────────
 # LOAD MAPPINGS
@@ -89,8 +90,22 @@ with torch.no_grad():
 # ──────────────────────────────────────────────────────
 # OUTPUT PREDICTIONS
 # ──────────────────────────────────────────────────────
-print("\nPredicted Edges with Sockets (prob > {:.2f}):".format(THRESHOLD))
+output_data = {
+    "node_sequence": sequence,
+    "edges": []
+}
+
 for idx, (src, dst) in enumerate(edge_list):
     if edge_probs[idx] > THRESHOLD:
-        print(f"{src} ({node_names.get(sequence[src], 'UNKNOWN')}) --[{socket_names.get(src_sock[idx], 'UNKNOWN')}]--> "
-              f"{dst} ({node_names.get(sequence[dst], 'UNKNOWN')}) [{socket_names.get(dst_sock[idx], 'UNKNOWN')}]  (score={edge_probs[idx]:.2f})")
+        output_data["edges"].append({
+            "src_idx": src,
+            "dst_idx": dst,
+            "src_socket": src_sock[idx],
+            "dst_socket": dst_sock[idx],
+            "prob": edge_probs[idx]
+        })
+
+with open("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Generated/predicted_material_graph.json", "w") as f:
+    json.dump(output_data, f, indent=2)
+
+print("\n✅ Saved predicted material graph to predicted_material_graph.json")
