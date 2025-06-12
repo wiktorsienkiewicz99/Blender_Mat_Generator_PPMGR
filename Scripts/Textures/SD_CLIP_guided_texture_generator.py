@@ -1,5 +1,5 @@
 import torch
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionPipeline, DiffusionPipeline
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image, ImageFilter
 import os
@@ -8,7 +8,7 @@ import os
 # CONFIGURATION
 # ─────────────────────────────────────
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-prompt = "seamless texture of oak wooden planks, tiled, PBR"
+prompt = "PBR texture of red brick wall, uniform lighting, base color only"
 output_dir = f"./generated_textures/{prompt.replace(' ', '_')}"
 num_variants = 5
 seed = 42
@@ -17,11 +17,15 @@ seed = 42
 # LOAD MODELS
 # ─────────────────────────────────────
 print("[+] Loading models...")
-pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5")
-pipe.safety_checker = lambda images, clip_input: (images, [False] * len(images))
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    "dream-textures/texture-diffusion",
+    safety_checker=None,
+    feature_extractor=None,
+)
 pipe = pipe.to(device)
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to("cpu")  # stay on CPU to save memory
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to("mps")
+clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=False)
 
 # ─────────────────────────────────────
 # GENERATE CANDIDATE IMAGES
@@ -45,7 +49,7 @@ scores = []
 
 for path in image_paths:
     image = Image.open(path).convert("RGB")
-    inputs = clip_processor(text=prompt, images=image, return_tensors="pt", padding=True).to("cpu")
+    inputs = clip_processor(text=prompt, images=image, return_tensors="pt", padding=True).to("mps")
     with torch.no_grad():
         outputs = clip_model(**inputs)
         similarity = outputs.logits_per_image.softmax(dim=1)[0][0].item()
@@ -54,7 +58,7 @@ for path in image_paths:
 # Sort by similarity score
 best_path, best_score = sorted(scores, key=lambda x: x[1], reverse=True)[0]
 best_image = Image.open(best_path)
-print(f"[✓] Best match: {os.path.basename(best_path)} (score={best_score:.4f})")
+print(f"Best match: {os.path.basename(best_path)} (score={best_score:.4f})")
 
 # Save as base_color + other maps
 base_name = os.path.join(output_dir, "base_color.png")
