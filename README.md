@@ -1,66 +1,111 @@
-# Blender AI Procedural Material Generator
+# Blender Material Generator
 
-Project is a toolset for extracting, processing, and analyzing Blender material graphs, with a focus on preparing data for machine learning pipelines. It supports scraping from `.blend` files, flattening node groups, cleaning edge data, generating node/edge dictionaries, and running graph-based neural network models on the resulting data.
+This project uses machine learning to generate materials for Blender. It consists of several components:
 
-## Features
+1. **Node Prediction**: Predicts a sequence of nodes for a material using a transformer-based model.
+2. **Edge Prediction**: Predicts edges between nodes using a Graph Neural Network (GNN).
+3. **Parameter Prediction**: Predicts parameters for each node using a multi-head neural network.
+4. **Texture Generation**: Generates textures for IMAGE TEX nodes using Stable Diffusion guided by CLIP.
+5. **Blender Import**: Imports the generated material into Blender.
 
-- Extracts full material node graphs from Blender
-- Flattens nested groups for clean, interpretable data
-- Prepares node/edge JSON files for ML models
-- Visualizes graphs for quick inspection
-- Provides transformer and GNN-based model templates
-- Enables both training and inference on material graphs
+## Workflow
 
-## File Breakdown
+The workflow for generating materials is as follows:
 
-### Graph Extraction & Processing
+1. Predict a sequence of nodes using the node autoregression model.
+2. Predict edges between nodes using the GNN edge predictor.
+3. Predict parameters for each node using the parameter predictor.
+4. (Optional) Generate textures for IMAGE TEX nodes using Stable Diffusion guided by CLIP.
+5. Import the material into Blender.
 
-| File                         | Description |
-|-----------------------------|-------------|
-| `scraper_final_automated.py` | Extracts materials, nodes, and edges from `.blend` files into structured JSON |
-| `nodes_edges_ids.py`         | Replaces node names with unique IDs and adds node type labels |
-| `create_dictionary.py`       | Generates mapping dictionaries for node names and types |
-| `edge_databse_preprocess.py` | Cleans and formats edge data across JSON files |
-| `plus_preprocess_edge.py`    | Enhances edge data with metadata or extra structure |
-| `json_merger.py`             | Merges multiple JSON outputs into unified node/edge files |
-| `visualizer.py`              | Visualizes the node-edge graph using `networkx` and `matplotlib` |
-| `run_scraper.sh`             | Bash script for batch scraping across a folder of `.blend` files |
-| `test_path.py`               | Utility script for validating path logic |
+## Usage
 
-### Machine Learning Models
+### Automated Workflow
 
-| File                         | Description |
-|-----------------------------|-------------|
-| `model_creator.py`           | Builds and trains a model (e.g., GNN or Transformer) on the processed graph data |
-| `model_use.py`               | Loads a trained model and runs inference on new graph data |
-| `GNN_model.py`               | Implements a Graph Neural Network for processing material graphs |
-| `transformer_edges_model.py` | Transformer-based model architecture focused on edge prediction |
-| `transformer_node_model.py`  | Transformer model for node-level prediction or classification |
+The entire workflow can be run automatically using the `material_generation_workflow.py` script:
 
-Typical Dependencies:
-	•	Python 3.8+
-	•	Blender (for data extraction) with materials saved to scene
-	•	networkx, matplotlib, numpy
-	•	torch, scikit-learn, transformers (if using ML models)
+```bash
+python Scripts/material_generation_workflow.py [options]
+```
 
-Example Use Case
+#### Options
 
-This toolchain can be used to:
-	•	Generate a dataset of Blender materials
-	•	Convert them into flat graphs with edge/node features
-	•	Train a GNN to predict missing edges
-	•	Train a Transformer to classify or embed node types
-	•	Visualize results for debugging
+- `--id2node-json PATH`: Path to id_to_node.json (default: /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/id_to_node.json)
+- `--model-in PATH`: Path to node generator model (default: /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Scripts/Nodes/node_generator_mps.pth)
+- `--edge-model PATH`: Path to edge predictor model (default: /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Models/Edges/gnn_edge_model.pt)
+- `--param-model PATH`: Path to parameter predictor model (default: /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Models/Parameters/param_predictor.pth)
+- `--output-json PATH`: Path to save the predicted material graph (default: /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Generated/predicted_material_graph.json)
+- `--material-name NAME`: Name of the material to create in Blender (default: "Generated_Material")
+- `--num-samples INT`: Number of node sequences to generate (default: 1)
+- `--max-len INT`: Maximum length of generated node sequences (default: 64)
+- `--top-p FLOAT`: Top-p sampling parameter (default: 0.9)
+- `--threshold FLOAT`: Edge prediction threshold (default: 0.95)
+- `--blender-path PATH`: Path to Blender executable (default: /Volumes/ProgramFiles/Apps/Blender_36.app/Contents/MacOS/Blender)
+- `--skip-blender`: Skip importing to Blender (default: False)
 
-PPMGR/
-├── blender_data/
-│   └── your_files.blend
-├── extracted_json/
-├── processed/
-├── models/
-│   └── GNN_model.py
-├── scripts/
-├── visualizer.py
-├── model_creator.py
-├── model_use.py
-├── ...
+#### Texture Generation Options
+- `--generate-textures`: Generate textures for IMAGE TEX nodes (default: False)
+- `--texture-prompt TEXT`: Prompt for texture generation (default: "PBR texture, uniform lighting")
+- `--texture-variants INT`: Number of texture variants to generate (default: 3)
+- `--texture-output-dir PATH`: Directory to save generated textures (default: "./Scripts/Textures/generated_textures")
+
+### Manual Workflow
+
+Alternatively, each step can be run manually:
+
+1. **Node Prediction**:
+   ```bash
+   python Scripts/Nodes/node_autoregression.py sample \
+     --id2node-json /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/id_to_node.json \
+     --model-in /Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Scripts/Nodes/node_generator_mps.pth \
+     --num-samples 5
+   ```
+
+2. **Edge Prediction**:
+   ```bash
+   python Scripts/Edges/gnn_edge_sampler.py
+   ```
+
+3. **Parameter Prediction**:
+   ```bash
+   python Scripts/Parameters/test_param_predictor.py
+   ```
+
+4. **Texture Generation** (optional):
+   ```bash
+   python Scripts/Textures/texture_generator.py --prompt "PBR texture of red brick wall" --output-dir ./Scripts/Textures/generated_textures
+   ```
+
+5. **Blender Import**:
+   ```bash
+   /Volumes/ProgramFiles/Apps/Blender_36.app/Contents/MacOS/Blender --python Scripts/Blender/import_predicted_material.py
+   ```
+
+## Requirements
+
+- Python 3.8+
+- PyTorch
+- PyTorch Geometric
+- Diffusers (for texture generation)
+- Transformers (for texture generation)
+- Pillow (for texture generation)
+- Blender 3.6+
+
+## Project Structure
+
+- `Dataset/`: Contains datasets for training and testing.
+  - `Auxiliary/`: Contains auxiliary files like mappings.
+  - `Generated/`: Contains generated material graphs.
+  - `Refined/`: Contains refined datasets.
+- `Models/`: Contains trained models.
+  - `Edges/`: Contains edge prediction models.
+  - `Nodes/`: Contains node prediction models.
+  - `Parameters/`: Contains parameter prediction models.
+- `Scripts/`: Contains scripts for each step of the workflow.
+  - `Blender/`: Contains scripts for importing materials to Blender.
+  - `Edges/`: Contains scripts for edge prediction.
+  - `Nodes/`: Contains scripts for node prediction.
+  - `Parameters/`: Contains scripts for parameter prediction.
+  - `Textures/`: Contains scripts for texture generation.
+    - `generated_textures/`: Contains generated textures.
+  - `material_generation_workflow.py`: Script for running the entire workflow.

@@ -15,7 +15,7 @@ from gnn_edge_predictor import GNNModel, NUM_NODE_TYPES, NUM_SOCKET_TYPES
 # ──────────────────────────────────────────────────────
 NODE_MAP_PATH = "/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/id_to_node.json"
 SOCKET_MAP_PATH = "/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Dataset/Auxiliary/id_to_socket.json"
-MODEL_PATH = "gnn_edge_model.pt"
+MODEL_PATH = "../../Models/Edges/gnn_edge_model.pt"
 THRESHOLD = 0.95
 
 # Example node type sequence for sampling
