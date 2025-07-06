@@ -171,6 +171,34 @@ def predict_nodes(args):
             best_sequence = [t for t in tokens if 1<=t<=N]
 
     print("\nSelected node sequence:", best_sequence)
+
+    # Ensure the sequence contains a Material Output node and at least one shader node
+    material_output_id = 43  # OUTPUT_MATERIAL
+    shader_node_ids = [6, 7, 8, 9, 10, 11, 12, 13, 24, 25, 28, 38, 52]  # Various shader nodes
+
+    # Check if Material Output node exists
+    has_material_output = material_output_id in best_sequence
+
+    # Check if at least one shader node exists
+    has_shader = any(shader_id in best_sequence for shader_id in shader_node_ids)
+
+    # If not, add the missing nodes
+    modified_sequence = best_sequence.copy()
+
+    if not has_material_output:
+        print("Adding Material Output node (OUTPUT_MATERIAL) to the sequence")
+        modified_sequence.append(material_output_id)
+
+    if not has_shader:
+        # Add a Principled BSDF shader (most commonly used)
+        principled_bsdf_id = 9  # BSDF_PRINCIPLED
+        print("Adding Principled BSDF shader node (BSDF_PRINCIPLED) to the sequence")
+        modified_sequence.append(principled_bsdf_id)
+
+    if modified_sequence != best_sequence:
+        print("\nModified node sequence to ensure Material Output and shader nodes:", modified_sequence)
+        best_sequence = modified_sequence
+
     return best_sequence
 
 def predict_edges(args, node_sequence):
@@ -243,6 +271,7 @@ def predict_edges(args, node_sequence):
         "edges": []
     }
 
+    # First, add predicted edges with high probability
     for idx, (src, dst) in enumerate(edge_list):
         if edge_probs[idx] > args.threshold:
             output_data["edges"].append({
@@ -252,6 +281,254 @@ def predict_edges(args, node_sequence):
                 "dst_socket": dst_sock[idx],
                 "prob": edge_probs[idx]
             })
+
+    # Track which nodes are connected
+    connected_nodes = set()
+    for edge in output_data["edges"]:
+        connected_nodes.add(edge["src_idx"])
+        connected_nodes.add(edge["dst_idx"])
+
+    # Find nodes that are not connected
+    unconnected_nodes = set(range(len(node_sequence))) - connected_nodes
+
+    # Find shader nodes and material output node
+    material_output_idx = None
+    shader_node_indices = []
+    tex_image_indices = []
+    tex_coord_indices = []
+    mapping_indices = []
+
+    for idx, node_id in enumerate(node_sequence):
+        node_type = node_names.get(node_id, "Unknown")
+        if node_type == "OUTPUT_MATERIAL":
+            material_output_idx = idx
+        elif node_type in ["BSDF_PRINCIPLED", "BSDF_DIFFUSE", "BSDF_GLASS", "BSDF_ANISOTROPIC", 
+                          "BSDF_REFRACTION", "BSDF_TOON", "BSDF_TRANSLUCENT", "BSDF_TRANSPARENT",
+                          "EEVEE_SPECULAR", "EMISSION", "MIX_SHADER", "ADD_SHADER", "SUBSURFACE_SCATTERING"]:
+            shader_node_indices.append(idx)
+        elif node_type == "TEX_IMAGE":
+            tex_image_indices.append(idx)
+        elif node_type == "TEX_COORD":
+            tex_coord_indices.append(idx)
+        elif node_type == "MAPPING":
+            mapping_indices.append(idx)
+
+    # Ensure shader is connected to material output
+    if material_output_idx is not None and shader_node_indices:
+        # Check if there's already a connection between a shader and material output
+        shader_to_output_exists = any(
+            edge["src_idx"] in shader_node_indices and edge["dst_idx"] == material_output_idx
+            for edge in output_data["edges"]
+        )
+
+        if not shader_to_output_exists:
+            # Connect the first shader to material output
+            print(f"Adding connection from shader node {shader_node_indices[0]} to Material Output node {material_output_idx}")
+            output_data["edges"].append({
+                "src_idx": shader_node_indices[0],
+                "dst_idx": material_output_idx,
+                "src_socket": 0,  # Assuming 0 is the shader output socket
+                "dst_socket": 0,  # Assuming 0 is the surface input socket on Material Output
+                "prob": 1.0
+            })
+            # Update connected nodes
+            connected_nodes.add(shader_node_indices[0])
+            connected_nodes.add(material_output_idx)
+            # Remove from unconnected if they were there
+            unconnected_nodes.discard(shader_node_indices[0])
+            unconnected_nodes.discard(material_output_idx)
+
+    # Handle Image Texture nodes - ensure they're in the chain: Texture Coordinate -> Mapping -> Image Texture
+    # First, check if we need to add missing nodes to the sequence
+    mapping_node_id = 33  # MAPPING
+    tex_coord_node_id = 56  # TEX_COORD
+
+    # Add missing nodes to the sequence if needed
+    modified_sequence = node_sequence.copy()
+    node_indices_updated = False
+
+    # If we have image textures but no mapping nodes, add one
+    if tex_image_indices and not mapping_indices:
+        print("Adding Mapping node to the sequence for Image Texture nodes")
+        modified_sequence.append(mapping_node_id)
+        # New index will be at the end of the sequence
+        new_mapping_idx = len(modified_sequence) - 1
+        mapping_indices.append(new_mapping_idx)
+        node_indices_updated = True
+
+    # If we have mapping nodes but no texture coordinate nodes, add one
+    if mapping_indices and not tex_coord_indices:
+        print("Adding Texture Coordinate node to the sequence for Mapping nodes")
+        modified_sequence.append(tex_coord_node_id)
+        # New index will be at the end of the sequence
+        new_texcoord_idx = len(modified_sequence) - 1
+        tex_coord_indices.append(new_texcoord_idx)
+        node_indices_updated = True
+
+    # If we modified the sequence, update the node_sequence in output_data
+    if node_indices_updated:
+        output_data["node_sequence"] = modified_sequence
+        print("Updated node sequence with missing nodes:", modified_sequence)
+
+    # Now connect the nodes in the chain
+    # Track which mapping nodes are connected to image textures
+    mapping_connected_to_image = set()
+
+    for tex_image_idx in tex_image_indices:
+        # Check if this texture node is already connected to a mapping node
+        tex_has_mapping = False
+        connected_mapping_idx = None
+
+        for edge in output_data["edges"]:
+            if edge["src_idx"] in mapping_indices and edge["dst_idx"] == tex_image_idx:
+                tex_has_mapping = True
+                connected_mapping_idx = edge["src_idx"]
+                mapping_connected_to_image.add(connected_mapping_idx)
+                break
+
+        # If not connected to mapping, connect it to an available mapping node
+        if not tex_has_mapping and mapping_indices:
+            # Try to use a mapping node that isn't already connected to an image texture
+            available_mapping = [idx for idx in mapping_indices if idx not in mapping_connected_to_image]
+
+            # If all mapping nodes are already connected, just use the first one
+            mapping_idx = available_mapping[0] if available_mapping else mapping_indices[0]
+
+            print(f"Adding connection from Mapping node {mapping_idx} to Image Texture node {tex_image_idx}")
+            output_data["edges"].append({
+                "src_idx": mapping_idx,
+                "dst_idx": tex_image_idx,
+                "src_socket": 0,  # Vector output
+                "dst_socket": 0,  # Vector input
+                "prob": 1.0
+            })
+            # Update connected nodes
+            connected_nodes.add(mapping_idx)
+            connected_nodes.add(tex_image_idx)
+            # Remove from unconnected if they were there
+            unconnected_nodes.discard(mapping_idx)
+            unconnected_nodes.discard(tex_image_idx)
+            # Mark this mapping node as connected to an image texture
+            mapping_connected_to_image.add(mapping_idx)
+
+    # Connect mapping nodes to texture coordinate nodes
+    for mapping_idx in mapping_indices:
+        # Check if this mapping node is already connected to a texture coordinate node
+        mapping_has_texcoord = any(
+            edge["src_idx"] in tex_coord_indices and edge["dst_idx"] == mapping_idx
+            for edge in output_data["edges"]
+        )
+
+        # If not connected to texture coordinate, connect it
+        if not mapping_has_texcoord and tex_coord_indices:
+            texcoord_idx = tex_coord_indices[0]  # Use the first texture coordinate node
+            print(f"Adding connection from Texture Coordinate node {texcoord_idx} to Mapping node {mapping_idx}")
+            output_data["edges"].append({
+                "src_idx": texcoord_idx,
+                "dst_idx": mapping_idx,
+                "src_socket": 0,  # UV output
+                "dst_socket": 0,  # Vector input
+                "prob": 1.0
+            })
+            # Update connected nodes
+            connected_nodes.add(texcoord_idx)
+            connected_nodes.add(mapping_idx)
+            # Remove from unconnected if they were there
+            unconnected_nodes.discard(texcoord_idx)
+            unconnected_nodes.discard(mapping_idx)
+
+    # Ensure all mapping nodes are connected to at least one image texture node
+    for mapping_idx in mapping_indices:
+        # Check if this mapping node is connected to any image texture node
+        mapping_connected_to_image = any(
+            edge["src_idx"] == mapping_idx and edge["dst_idx"] in tex_image_indices
+            for edge in output_data["edges"]
+        )
+
+        # If not connected to any image texture, try to connect it to one
+        if not mapping_connected_to_image and tex_image_indices:
+            # Find an image texture that doesn't already have a mapping connection
+            available_tex_images = []
+            for tex_idx in tex_image_indices:
+                has_mapping = any(
+                    edge["src_idx"] in mapping_indices and edge["dst_idx"] == tex_idx
+                    for edge in output_data["edges"]
+                )
+                if not has_mapping:
+                    available_tex_images.append(tex_idx)
+
+            # If all image textures already have mapping connections, just connect to the first one
+            tex_image_idx = available_tex_images[0] if available_tex_images else tex_image_indices[0]
+
+            print(f"Adding connection from Mapping node {mapping_idx} to Image Texture node {tex_image_idx}")
+            output_data["edges"].append({
+                "src_idx": mapping_idx,
+                "dst_idx": tex_image_idx,
+                "src_socket": 0,  # Vector output
+                "dst_socket": 0,  # Vector input
+                "prob": 1.0
+            })
+            # Update connected nodes
+            connected_nodes.add(mapping_idx)
+            connected_nodes.add(tex_image_idx)
+            # Remove from unconnected if they were there
+            unconnected_nodes.discard(mapping_idx)
+            unconnected_nodes.discard(tex_image_idx)
+
+    # Connect any remaining unconnected nodes to something
+    if unconnected_nodes:
+        print(f"Found {len(unconnected_nodes)} unconnected nodes, connecting them to the graph")
+
+        # For each unconnected node, find a suitable node to connect to
+        for node_idx in unconnected_nodes:
+            node_id = node_sequence[node_idx]
+            node_type = node_names.get(node_id, "Unknown")
+
+            # Try to find a meaningful connection based on node type
+            if node_type in ["BSDF_PRINCIPLED", "BSDF_DIFFUSE", "BSDF_GLASS", "BSDF_ANISOTROPIC", 
+                            "BSDF_REFRACTION", "BSDF_TOON", "BSDF_TRANSLUCENT", "BSDF_TRANSPARENT",
+                            "EEVEE_SPECULAR", "EMISSION", "MIX_SHADER", "ADD_SHADER", "SUBSURFACE_SCATTERING"]:
+                # Shader node - connect to material output if available
+                if material_output_idx is not None:
+                    print(f"Connecting shader node {node_idx} to Material Output node {material_output_idx}")
+                    output_data["edges"].append({
+                        "src_idx": node_idx,
+                        "dst_idx": material_output_idx,
+                        "src_socket": 0,  # Shader output
+                        "dst_socket": 0,  # Surface input
+                        "prob": 1.0
+                    })
+                    continue
+
+            # Special handling for Image Texture nodes - connect to shader inputs if possible
+            elif node_type == "TEX_IMAGE":
+                # Try to connect to a shader node input (like Base Color on Principled BSDF)
+                if shader_node_indices:
+                    shader_idx = shader_node_indices[0]  # Use the first shader node
+                    # Common socket for color/texture input is 0 (Base Color for Principled BSDF)
+                    print(f"Connecting Image Texture node {node_idx} to Shader node {shader_idx}")
+                    output_data["edges"].append({
+                        "src_idx": node_idx,
+                        "dst_idx": shader_idx,
+                        "src_socket": 0,  # Color output
+                        "dst_socket": 0,  # Base Color input (for Principled BSDF)
+                        "prob": 1.0
+                    })
+                    continue
+
+            # For other node types or if no specific connection was made, connect to any other node
+            # Prefer connecting to nodes that are already connected
+            potential_targets = list(connected_nodes - {node_idx})
+            if potential_targets:
+                target_idx = potential_targets[0]  # Just pick the first one
+                print(f"Connecting node {node_idx} to node {target_idx}")
+                output_data["edges"].append({
+                    "src_idx": node_idx,
+                    "dst_idx": target_idx,
+                    "src_socket": 0,  # Default output socket
+                    "dst_socket": 0,  # Default input socket
+                    "prob": 1.0
+                })
 
     # Save to file
     with open(args.output_json, "w") as f:
