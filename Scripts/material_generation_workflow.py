@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+
+
+
+"""
+Kontekst na podstawie nazwy materiału
+Nie linkują się TEX_IMAGE
+Zapiąć Roughness, itp
+Przejrzeć nadpisywanie edgy
+Ujarzmić specular
+Textury - link do datasetu w zakładce
+"""
+
+
+
+
 """
 Material Generation Workflow
 
