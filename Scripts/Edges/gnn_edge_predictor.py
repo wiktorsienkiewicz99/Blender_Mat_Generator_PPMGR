@@ -51,9 +51,60 @@ class GraphEdgeDataset(Dataset):
     def __init__(self, path: str, num_negatives: int = NUM_NEGATIVES):
         super().__init__()
         with open(path, 'r') as f:
-            all_graphs = json.load(f)
-            self.graphs = [g for g in all_graphs if len(g["nodes"]) <= 30]
+            data = json.load(f)
+
+            # Check if the data is in the new format with material names
+            if isinstance(data, dict) and "materials" in data:
+                # New format with material names
+                self.graphs = []
+                self.material_names = []
+
+                for material_name, material_data in data["materials"].items():
+                    if "nodes" in material_data and len(material_data["nodes"]) <= 30:
+                        # Extract node IDs and edges
+                        nodes = [node_to_id.get(n.get("type")) for n in material_data["nodes"] if n.get("type") in node_to_id]
+
+                        # Build edges list
+                        edges = []
+                        for i, node in enumerate(material_data["nodes"]):
+                            for output in node.get("outputs", []):
+                                for link in output.get("links", []):
+                                    if "to_node_idx" in link and "to_socket_idx" in link:
+                                        src = i
+                                        src_sock = output.get("socket_index", 0)
+                                        dst = link["to_node_idx"]
+                                        dst_sock = link["to_socket_idx"]
+                                        edges.append((src, src_sock, dst, dst_sock))
+
+                        # Create graph
+                        graph = {
+                            "nodes": nodes,
+                            "edges": edges
+                        }
+
+                        self.graphs.append(graph)
+                        self.material_names.append(material_name)
+            else:
+                # Old format without material names
+                self.graphs = [g for g in data if len(g["nodes"]) <= 30]
+                self.material_names = ["unknown"] * len(self.graphs)
+
         self.num_negatives = num_negatives
+
+        # Process material names with TF-IDF
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.preprocessing import normalize
+
+        self.vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(2, 5))
+        self.material_name_features = self.vectorizer.fit_transform(self.material_names)
+        self.material_name_features = normalize(self.material_name_features, norm='l2')
+
+        # Save vectorizer for later use
+        import pickle
+        import os
+        vectorizer_path = os.path.join("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Models/Edges", "material_name_vectorizer.pkl")
+        with open(vectorizer_path, 'wb') as f:
+            pickle.dump(self.vectorizer, f)
 
     def __len__(self):
         return len(self.graphs)
@@ -62,6 +113,9 @@ class GraphEdgeDataset(Dataset):
         g = self.graphs[idx]
         node_types = torch.tensor(g["nodes"], dtype=torch.long)
         x = F.one_hot(node_types, NUM_NODE_TYPES).float()
+
+        # Get material name features
+        material_features = torch.tensor(self.material_name_features[idx].toarray(), dtype=torch.float32).squeeze(0)
 
         id_to_local = {nid: i for i, nid in enumerate(g["nodes"])}
         existing_edges = set(
@@ -101,15 +155,16 @@ class GraphEdgeDataset(Dataset):
             edge_exists=torch.tensor(edge_exists, dtype=torch.float32),
             socket_mask=torch.tensor(socket_mask, dtype=torch.float32),
             edge_type_pair=torch.tensor(edge_type_pair, dtype=torch.long),
-            edge_distance=torch.tensor(edge_distance, dtype=torch.float32).unsqueeze(-1)
+            edge_distance=torch.tensor(edge_distance, dtype=torch.float32).unsqueeze(-1),
+            material_features=material_features
         )
 
 # ──────────────────────────────────────────────────────
 # MODEL
 # ──────────────────────────────────────────────────────
 class GNNModel(nn.Module):
-    """Graph Convolutional Network with edge feature conditioning."""
-    def __init__(self, input_dim, hidden_dim):
+    """Graph Convolutional Network with edge feature conditioning and material name context."""
+    def __init__(self, input_dim, hidden_dim, material_feature_dim=None):
         super().__init__()
         self.gcn1 = GCNConv(input_dim, hidden_dim)
         self.gcn2 = GCNConv(hidden_dim, hidden_dim)
@@ -122,20 +177,80 @@ class GNNModel(nn.Module):
         self.type_embedding = nn.Embedding(NUM_NODE_TYPES * NUM_NODE_TYPES, 32)
         self.distance_embedding = nn.Linear(1, 8)
 
-        self.edge_classifier = nn.Linear(hidden_dim * 2 + 32 + 8, 1)
-        self.socket_predictor = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 32 + 8, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, 2 * NUM_SOCKET_TYPES)
-        )
+        # Material name context processing
+        self.has_material_context = material_feature_dim is not None
+        if self.has_material_context:
+            # Use a fixed intermediate dimension for material features
+            self.fixed_dim = 64
+            self.material_adapter = nn.Linear(1, self.fixed_dim)  # Will be resized dynamically
+            self.material_projection = nn.Linear(self.fixed_dim, hidden_dim)
+            self.material_attention = nn.Linear(hidden_dim, 1)
+
+            # Edge features with material context
+            self.edge_classifier = nn.Linear(hidden_dim * 2 + 32 + 8 + hidden_dim, 1)
+            self.socket_predictor = nn.Sequential(
+                nn.Linear(hidden_dim * 2 + 32 + 8 + hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, 2 * NUM_SOCKET_TYPES)
+            )
+        else:
+            # Original edge features without material context
+            self.edge_classifier = nn.Linear(hidden_dim * 2 + 32 + 8, 1)
+            self.socket_predictor = nn.Sequential(
+                nn.Linear(hidden_dim * 2 + 32 + 8, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, 2 * NUM_SOCKET_TYPES)
+            )
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
+
+        # Process material features if available
+        material_context = None
+        if self.has_material_context and hasattr(data, 'material_features'):
+            material_features = data.material_features
+            # Ensure material_features has at least 2 dimensions
+            if material_features.dim() == 1:
+                material_features = material_features.unsqueeze(0)
+
+            # Resize the adapter layer if needed
+            input_dim = material_features.size(1)
+            if self.material_adapter.in_features != input_dim:
+                # Create a new adapter layer with the correct input dimension
+                new_adapter = nn.Linear(input_dim, self.fixed_dim).to(material_features.device)
+                # Initialize with xavier uniform weights
+                nn.init.xavier_uniform_(new_adapter.weight)
+                self.material_adapter = new_adapter
+
+            # Apply the adapter followed by the projection
+            adapted_features = self.material_adapter(material_features)
+            material_embedding = self.material_projection(adapted_features)
+            material_context = material_embedding
+
+        # Apply GCN layers
         x = self.dropout(self.norm1(self.gcn1(x, edge_index)).relu())
         x = self.dropout(self.norm2(self.gcn2(x, edge_index)).relu())
         x = self.dropout(self.norm3(self.gcn3(x, edge_index)).relu())
 
+        # Apply material context through attention if available
+        if material_context is not None:
+            # Ensure material_context is properly shaped for attention
+            if material_context.dim() == 2:
+                # If material_context has batch dimension, use the first item
+                material_context_vec = material_context[0]
+            else:
+                material_context_vec = material_context
+
+            # Calculate attention scores
+            attention_scores = torch.matmul(x, material_context_vec.unsqueeze(-1)).squeeze(-1)
+            attention_weights = torch.softmax(attention_scores, dim=0).unsqueeze(-1)
+
+            # Apply attention weights
+            x = x * attention_weights + x  # Residual connection
+
+        # Edge feature processing
         src_nodes = edge_index[0]
         dst_nodes = edge_index[1]
         edge_reps = torch.cat([x[src_nodes], x[dst_nodes]], dim=1)
@@ -143,7 +258,21 @@ class GNNModel(nn.Module):
         type_pair_ids = data.edge_type_pair[:, 0] * NUM_NODE_TYPES + data.edge_type_pair[:, 1]
         type_embed = self.type_embedding(type_pair_ids)
         dist_embed = self.distance_embedding(data.edge_distance)
-        edge_input = torch.cat([edge_reps, type_embed, dist_embed], dim=1)
+
+        # Include material context in edge features if available
+        if material_context is not None:
+            # Ensure material_context is properly shaped for edge features
+            if material_context.dim() == 2:
+                # If material_context has batch dimension, use the first item
+                material_context_vec = material_context[0]
+            else:
+                material_context_vec = material_context
+
+            # Expand material context for each edge
+            edge_material_context = material_context_vec.unsqueeze(0).expand(edge_reps.size(0), -1)
+            edge_input = torch.cat([edge_reps, type_embed, dist_embed, edge_material_context], dim=1)
+        else:
+            edge_input = torch.cat([edge_reps, type_embed, dist_embed], dim=1)
 
         edge_exists = self.edge_classifier(edge_input).squeeze(-1)
         socket_logits = self.socket_predictor(edge_input)
@@ -228,7 +357,29 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
 
-    model = GNNModel(input_dim=NUM_NODE_TYPES, hidden_dim=HIDDEN_DIM).to(device)
+    # Get material feature dimension from the dataset
+    sample_data = dataset[0]
+    material_feature_dim = sample_data.material_features.size(0) if hasattr(sample_data, 'material_features') else None
+
+    # Create model with material feature dimension
+    model = GNNModel(
+        input_dim=NUM_NODE_TYPES, 
+        hidden_dim=HIDDEN_DIM,
+        material_feature_dim=material_feature_dim
+    ).to(device)
+
+    # Save model metadata for later use during inference
+    model_metadata = {
+        "has_material_context": material_feature_dim is not None,
+        "material_feature_dim": material_feature_dim
+    }
+
+    import os
+    import json
+    metadata_path = os.path.join("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Models/Edges", "model_metadata.json")
+    with open(metadata_path, 'w') as f:
+        json.dump(model_metadata, f)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(POS_WEIGHT, device=device))
     ce = nn.CrossEntropyLoss()
@@ -245,7 +396,8 @@ def main():
         if sock_acc > best_socket_acc:
             best_socket_acc = sock_acc
             streak = 0
-            torch.save(model.state_dict(), "test_gnn_edge_model.pt")
+            # Save the model
+            torch.save(model.state_dict(), "/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Models/Edges/gnn_edge_model.pt")
         else:
             streak += 1
             if streak >= PATIENCE:

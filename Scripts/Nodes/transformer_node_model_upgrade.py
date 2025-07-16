@@ -86,29 +86,38 @@ def preprocess_dataset_with_ids(input_file, output_file, node_to_id_file):
     with open(node_to_id_file, "r") as f:
         node_to_id = json.load(f)
 
-    logging.info("Converting node types to IDs and adding BOS/EOS tokens...")
+    logging.info("Converting node types to IDs and adding BOS/EOS tokens with material name context...")
     sequences = []
-    for _, material_data in raw_data.get("materials", {}).items():
+    material_names = []
+
+    for material_name, material_data in raw_data.get("materials", {}).items():
         ids = [node_to_id[n.get("type")] for n in material_data.get("nodes", []) if n.get("type") in node_to_id]
         if not ids:
             continue
         seq = [BOS_TOKEN] + [str(i) for i in ids] + [EOS_TOKEN]
         sequences.append(" ".join(seq))
+        material_names.append(material_name)
 
     if not sequences:
         raise ValueError("No valid sequences found in the raw dataset!")
 
+    # Create a dictionary with material names and sequences
+    data_with_context = {
+        "sequences": sequences,
+        "material_names": material_names
+    }
+
     with open(output_file, "w") as f:
-        json.dump(sequences, f, indent=4)
-    logging.info(f"Saved {len(sequences)} cleaned sequences to '{output_file}'")
-    return sequences
+        json.dump(data_with_context, f, indent=4)
+    logging.info(f"Saved {len(sequences)} cleaned sequences with material names to '{output_file}'")
+    return sequences, material_names
 
 # -----------------------------------------------------------------------------
 # Training routine with validation, dropout, and early stopping
 # -----------------------------------------------------------------------------
 def train_model():
     # Preprocess
-    sequences = preprocess_dataset_with_ids(database_path, cleaned_data_path, node_to_id_path)
+    sequences, material_names = preprocess_dataset_with_ids(database_path, cleaned_data_path, node_to_id_path)
 
     # Tokenizer
     tokenizer = get_fixed_tokenizer()
@@ -121,42 +130,122 @@ def train_model():
     model.resize_token_embeddings(len(tokenizer))
     model.to(device)
 
+    # Process material names - convert to embeddings
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.preprocessing import normalize
+
+    # Create TF-IDF vectorizer for material names
+    vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(2, 5))
+    material_name_features = vectorizer.fit_transform(material_names)
+    material_name_features = normalize(material_name_features, norm='l2')
+    material_name_features = torch.tensor(material_name_features.toarray(), dtype=torch.float32)
+
+    # Save vectorizer for later use during generation
+    import pickle
+    with open(os.path.join(models_nodes_folder_path, "material_name_vectorizer.pkl"), 'wb') as f:
+        pickle.dump(vectorizer, f)
+
     # Tokenize once
     if not os.path.exists(tokenized_data_path):
         tokenized = tokenizer(sequences, padding="longest", truncation=True, return_tensors="pt")
-        torch.save(tokenized, tokenized_data_path)
+        torch.save({
+            "tokenized": tokenized,
+            "material_name_features": material_name_features
+        }, tokenized_data_path)
 
     # Dataset split
-    tokenized = torch.load(tokenized_data_path)
-    dataset   = TensorDataset(tokenized["input_ids"], tokenized["attention_mask"])
-    total     = len(dataset)
-    val_size  = int(0.1 * total)
+    data = torch.load(tokenized_data_path)
+    tokenized = data["tokenized"] if "tokenized" in data else data
+    material_name_features = data.get("material_name_features", material_name_features)
+
+    dataset = TensorDataset(tokenized["input_ids"], tokenized["attention_mask"], material_name_features)
+    total = len(dataset)
+    val_size = int(0.1 * total)
     train_size = total - val_size
     train_ds, val_ds = random_split(dataset, [train_size, val_size])
+
+    # Create a custom model that incorporates material name features
+    class MaterialAwareGPT(nn.Module):
+        def __init__(self, base_model, material_feature_dim):
+            super().__init__()
+            self.base_model = base_model
+            # Use a fixed intermediate dimension for material features
+            self.fixed_dim = 128
+            self.material_adapter = nn.Linear(1, self.fixed_dim)  # Will be resized dynamically
+            self.material_projection = nn.Linear(self.fixed_dim, self.base_model.config.hidden_size)
+            self.material_attention = nn.Linear(self.base_model.config.hidden_size, 1)
+
+        def forward(self, input_ids, attention_mask, material_features, labels=None):
+            # Ensure material_features has at least 2 dimensions
+            if material_features.dim() == 1:
+                material_features = material_features.unsqueeze(0)
+
+            # Resize the adapter layer if needed
+            input_dim = material_features.size(1)
+            if self.material_adapter.in_features != input_dim:
+                # Create a new adapter layer with the correct input dimension
+                new_adapter = nn.Linear(input_dim, self.fixed_dim).to(material_features.device)
+                # Initialize with xavier uniform weights
+                nn.init.xavier_uniform_(new_adapter.weight)
+                self.material_adapter = new_adapter
+
+            # Apply the adapter followed by the projection
+            adapted_features = self.material_adapter(material_features)
+            material_embedding = self.material_projection(adapted_features).unsqueeze(1)  # [batch, 1, hidden_size]
+
+            # Get base model outputs
+            outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, output_hidden_states=True)
+
+            # Get the hidden states
+            hidden_states = outputs.hidden_states[-1]  # [batch, seq_len, hidden_size]
+
+            # Apply material context through attention
+            attention_scores = self.material_attention(hidden_states).squeeze(-1)  # [batch, seq_len]
+            attention_weights = torch.softmax(attention_scores, dim=1).unsqueeze(-1)  # [batch, seq_len, 1]
+
+            # Apply attention weights to hidden states
+            weighted_hidden = hidden_states * attention_weights
+
+            # Add material context
+            material_context = material_embedding.expand(-1, hidden_states.size(1), -1)
+            enhanced_hidden = weighted_hidden + material_context
+
+            # Replace the last hidden state in the outputs
+            outputs.hidden_states = outputs.hidden_states[:-1] + (enhanced_hidden,)
+
+            return outputs
+
+    # Wrap the base model with our custom model
+    material_feature_dim = material_name_features.size(1)
+    material_aware_model = MaterialAwareGPT(model, material_feature_dim).to(device)
 
     train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=4, shuffle=False, num_workers=0)
 
     # Optimizer & scaler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(material_aware_model.parameters(), lr=1e-5, weight_decay=0.01)
     scaler    = GradScaler(enabled=(device.type == "cuda"))
     grad_accum = 4
-    max_epochs = 10
+    max_epochs = 1
     patience   = 2
     best_val_loss = float('inf')
     patience_counter = 0
 
     for epoch in range(1, max_epochs+1):
-        model.train()
-        for step, (input_ids, attention_mask) in enumerate(train_loader, start=1):
+        material_aware_model.train()
+        for step, (input_ids, attention_mask, material_features) in enumerate(train_loader, start=1):
             input_ids, attention_mask = input_ids.to(device), attention_mask.to(device)
+            material_features = material_features.to(device)
+
             if device.type == "cuda":
                 with autocast():
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
+                    outputs = material_aware_model(input_ids=input_ids, attention_mask=attention_mask, 
+                                                  material_features=material_features, labels=input_ids)
                     loss = outputs.loss / grad_accum
                 scaler.scale(loss).backward()
             else:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
+                outputs = material_aware_model(input_ids=input_ids, attention_mask=attention_mask, 
+                                              material_features=material_features, labels=input_ids)
                 loss = outputs.loss / grad_accum
                 loss.backward()
 
@@ -172,12 +261,14 @@ def train_model():
                 logging.info(f"Epoch {epoch} Step {step}, Loss: {loss.item():.4f}")
 
         # Validation
-        model.eval()
+        material_aware_model.eval()
         total_val_loss = 0.0
         with torch.no_grad():
-            for input_ids, attention_mask in val_loader:
+            for input_ids, attention_mask, material_features in val_loader:
                 input_ids, attention_mask = input_ids.to(device), attention_mask.to(device)
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
+                material_features = material_features.to(device)
+                outputs = material_aware_model(input_ids=input_ids, attention_mask=attention_mask, 
+                                              material_features=material_features, labels=input_ids)
                 total_val_loss += outputs.loss.item()
         avg_val_loss = total_val_loss / len(val_loader)
         val_ppl = torch.exp(torch.tensor(avg_val_loss))
@@ -187,8 +278,19 @@ def train_model():
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
+
+            # Save the base model
             model.save_pretrained(model_save_path)
             tokenizer.save_pretrained(model_save_path)
+
+            # Save the material-aware model
+            material_model_path = os.path.join(model_save_path, "node_model.pt")
+            torch.save({
+                "model_state_dict": material_aware_model.state_dict(),
+                "material_feature_dim": material_feature_dim,
+                "base_model_path": model_save_path
+            }, material_model_path)
+
             logging.info(f"Checkpointed epoch {epoch}")
         else:
             patience_counter += 1
@@ -201,11 +303,118 @@ def train_model():
 # -----------------------------------------------------------------------------
 # Generation routine (unchanged)
 # -----------------------------------------------------------------------------
-def use_model(start_sequence="1 2", num_candidates=5):
+def use_model(start_sequence="1 2", num_candidates=5, material_name=None):
     tokenizer = get_fixed_tokenizer()
-    model     = AutoModelForCausalLM.from_pretrained(model_save_path)
-    model.resize_token_embeddings(len(tokenizer))
-    model.to(device)
+    base_model = AutoModelForCausalLM.from_pretrained(model_save_path)
+    base_model.resize_token_embeddings(len(tokenizer))
+    base_model.to(device)
+
+    # Load the material-aware model if material_name is provided
+    material_aware_model = None
+    if material_name:
+        material_model_path = os.path.join(model_save_path, "material_aware_model.pt")
+        if os.path.exists(material_model_path):
+            # Load the vectorizer
+            import pickle
+            vectorizer_path = os.path.join(models_nodes_folder_path, "material_name_vectorizer.pkl")
+            with open(vectorizer_path, 'rb') as f:
+                vectorizer = pickle.load(f)
+
+            # Process the material name
+            material_features = vectorizer.transform([material_name])
+            material_features = torch.tensor(material_features.toarray(), dtype=torch.float32).to(device)
+
+            # Load the material-aware model
+            checkpoint = torch.load(material_model_path, map_location=device)
+            material_feature_dim = checkpoint["material_feature_dim"]
+
+            # Recreate the MaterialAwareGPT class
+            class MaterialAwareGPT(nn.Module):
+                def __init__(self, base_model, material_feature_dim):
+                    super().__init__()
+                    self.base_model = base_model
+                    # Use a fixed intermediate dimension for material features
+                    self.fixed_dim = 128
+                    self.material_adapter = nn.Linear(1, self.fixed_dim)  # Will be resized dynamically
+                    self.material_projection = nn.Linear(self.fixed_dim, self.base_model.config.hidden_size)
+                    self.material_attention = nn.Linear(self.base_model.config.hidden_size, 1)
+
+                def forward(self, input_ids, attention_mask, material_features, labels=None):
+                    # Ensure material_features has at least 2 dimensions
+                    if material_features.dim() == 1:
+                        material_features = material_features.unsqueeze(0)
+
+                    # Resize the adapter layer if needed
+                    input_dim = material_features.size(1)
+                    if self.material_adapter.in_features != input_dim:
+                        # Create a new adapter layer with the correct input dimension
+                        new_adapter = nn.Linear(input_dim, self.fixed_dim).to(material_features.device)
+                        # Initialize with xavier uniform weights
+                        nn.init.xavier_uniform_(new_adapter.weight)
+                        self.material_adapter = new_adapter
+
+                    # Apply the adapter followed by the projection
+                    adapted_features = self.material_adapter(material_features)
+                    material_embedding = self.material_projection(adapted_features).unsqueeze(1)  # [batch, 1, hidden_size]
+
+                    # Get base model outputs
+                    outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, output_hidden_states=True)
+
+                    # Get the hidden states
+                    hidden_states = outputs.hidden_states[-1]  # [batch, seq_len, hidden_size]
+
+                    # Apply material context through attention
+                    attention_scores = self.material_attention(hidden_states).squeeze(-1)  # [batch, seq_len]
+                    attention_weights = torch.softmax(attention_scores, dim=1).unsqueeze(-1)  # [batch, seq_len, 1]
+
+                    # Apply attention weights to hidden states
+                    weighted_hidden = hidden_states * attention_weights
+
+                    # Add material context
+                    material_context = material_embedding.expand(-1, hidden_states.size(1), -1)
+                    enhanced_hidden = weighted_hidden + material_context
+
+                    # Replace the last hidden state in the outputs
+                    outputs.hidden_states = outputs.hidden_states[:-1] + (enhanced_hidden,)
+
+                    return outputs
+
+                def generate(self, input_ids, attention_mask, material_features, **kwargs):
+                    # For generation, we'll use the base model but enhance its hidden states with material context
+                    # This is a simplified approach - in a real implementation, you might want to modify the generation process
+                    # to incorporate material context at each step
+
+                    # Ensure material_features has at least 2 dimensions
+                    if material_features.dim() == 1:
+                        material_features = material_features.unsqueeze(0)
+
+                    # Resize the adapter layer if needed
+                    input_dim = material_features.size(1)
+                    if self.material_adapter.in_features != input_dim:
+                        # Create a new adapter layer with the correct input dimension
+                        new_adapter = nn.Linear(input_dim, self.fixed_dim).to(material_features.device)
+                        # Initialize with xavier uniform weights
+                        nn.init.xavier_uniform_(new_adapter.weight)
+                        self.material_adapter = new_adapter
+
+                    # Apply the adapter followed by the projection
+                    adapted_features = self.material_adapter(material_features)
+                    material_embedding = self.material_projection(adapted_features).unsqueeze(1)
+
+                    # Use the base model for generation
+                    return self.base_model.generate(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+
+            # Create and load the material-aware model
+            material_aware_model = MaterialAwareGPT(base_model, material_feature_dim).to(device)
+            material_aware_model.load_state_dict(checkpoint["model_state_dict"])
+            material_aware_model.eval()
+
+            logging.info(f"Using material-aware model with material name: {material_name}")
+        else:
+            logging.warning(f"Material-aware model not found at {material_model_path}, using base model instead")
+
+    # Use the appropriate model
+    model = material_aware_model if material_aware_model else base_model
     model.eval()
 
     with open(node_to_id_path) as f:
@@ -221,18 +430,34 @@ def use_model(start_sequence="1 2", num_candidates=5):
     enc = tokenizer(prompt, return_tensors="pt")
     input_ids, attention_mask = enc.input_ids.to(device), enc.attention_mask.to(device)
 
-    outputs = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_length=80,
-        do_sample=True,
-        temperature=1.0,
-        top_p=0.9,
-        repetition_penalty=1.2,
-        num_return_sequences=num_candidates,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id
-    )
+    # Generate with the appropriate model
+    if material_aware_model and material_name:
+        outputs = material_aware_model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            material_features=material_features,
+            max_length=80,
+            do_sample=True,
+            temperature=1.0,
+            top_p=0.9,
+            repetition_penalty=1.2,
+            num_return_sequences=num_candidates,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id
+        )
+    else:
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_length=80,
+            do_sample=True,
+            temperature=1.0,
+            top_p=0.9,
+            repetition_penalty=1.2,
+            num_return_sequences=num_candidates,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id
+        )
 
     chosen = None
     for seq in outputs:
@@ -260,5 +485,5 @@ def use_model(start_sequence="1 2", num_candidates=5):
 # Entry point
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    #train_model()
-    use_model()  # uncomment to generate sequences
+    train_model()
+    #use_model()  # uncomment to generate sequences

@@ -80,6 +80,7 @@ class ParamDataset(Dataset):
         self.dropdown_classes = dropdown_classes
         self.checkbox_classes = checkbox_classes
         self.node_type_to_params = node_type_to_params
+        self.material_names = []
 
         self.node_types = sorted({
             node["type"]
@@ -92,7 +93,7 @@ class ParamDataset(Dataset):
         self.param_keys = sorted(list(all_keys))
         self.param_index = {k: i for i, k in enumerate(self.param_keys)}
 
-        for mat in data["materials"].values():
+        for material_name, mat in data["materials"].items():
             for node in mat["nodes"]:
                 node_type = node["type"]
                 valid_params = set(node_type_to_params.get(node_type, []))
@@ -107,11 +108,32 @@ class ParamDataset(Dataset):
                             for i, v in enumerate(parsed):
                                 key_i = f"{key}.{i}"
                                 if key_i in valid_params and key_i in param_ranges:
-                                    self.samples.append({"x": x, "param_key": key_i, "y": self.normalize(v, key_i), "type": "reg"})
+                                    self.samples.append({
+                                        "x": x, 
+                                        "param_key": key_i, 
+                                        "y": self.normalize(v, key_i), 
+                                        "type": "reg",
+                                        "material_name": material_name
+                                    })
+                                    self.material_names.append(material_name)
                         elif isinstance(val, (int, float)) and key in valid_params and key in param_ranges:
-                            self.samples.append({"x": x, "param_key": key, "y": self.normalize(val, key), "type": "reg"})
+                            self.samples.append({
+                                "x": x, 
+                                "param_key": key, 
+                                "y": self.normalize(val, key), 
+                                "type": "reg",
+                                "material_name": material_name
+                            })
+                            self.material_names.append(material_name)
                         elif isinstance(val, bool) and key in valid_params and key in checkbox_classes:
-                            self.samples.append({"x": x, "param_key": key, "y": int(val), "type": "bin"})
+                            self.samples.append({
+                                "x": x, 
+                                "param_key": key, 
+                                "y": int(val), 
+                                "type": "bin",
+                                "material_name": material_name
+                            })
+                            self.material_names.append(material_name)
 
                 for k, v in node.get("parameters", {}).items():
                     if k in ["Image Name", "Image Path"]:
@@ -119,21 +141,58 @@ class ParamDataset(Dataset):
                     if k not in valid_params:
                         continue
                     if isinstance(v, (int, float)) and k in param_ranges:
-                        self.samples.append({"x": x, "param_key": k, "y": self.normalize(v, k), "type": "reg"})
+                        self.samples.append({
+                            "x": x, 
+                            "param_key": k, 
+                            "y": self.normalize(v, k), 
+                            "type": "reg",
+                            "material_name": material_name
+                        })
+                        self.material_names.append(material_name)
                     elif isinstance(v, str) and k in dropdown_classes:
                         y = dropdown_classes[k].index(v)
-                        self.samples.append({"x": x, "param_key": k, "y": y, "type": "cls"})
+                        self.samples.append({
+                            "x": x, 
+                            "param_key": k, 
+                            "y": y, 
+                            "type": "cls",
+                            "material_name": material_name
+                        })
+                        self.material_names.append(material_name)
                     elif isinstance(v, bool) and k in checkbox_classes:
-                        self.samples.append({"x": x, "param_key": k, "y": int(v), "type": "bin"})
+                        self.samples.append({
+                            "x": x, 
+                            "param_key": k, 
+                            "y": int(v), 
+                            "type": "bin",
+                            "material_name": material_name
+                        })
+                        self.material_names.append(material_name)
 
         self.param_types = {s["param_key"]: s["type"] for s in self.samples}
+
+        # Process material names with TF-IDF
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.preprocessing import normalize
+
+        self.vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(2, 5))
+        self.material_name_features = self.vectorizer.fit_transform(self.material_names)
+        self.material_name_features = normalize(self.material_name_features, norm='l2')
+
+        # Save vectorizer for later use
+        import pickle
+        import os
+        vectorizer_path = os.path.join("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Models/Parameters", "material_name_vectorizer.pkl")
+        with open(vectorizer_path, 'wb') as f:
+            pickle.dump(self.vectorizer, f)
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        return torch.tensor(s["x"], dtype=torch.float32), torch.tensor(s["y"]), self.param_index[s["param_key"]], s["param_key"], s["type"]
+        material_features = torch.tensor(self.material_name_features[idx].toarray(), dtype=torch.float32).squeeze(0)
+        return torch.tensor(s["x"], dtype=torch.float32), torch.tensor(s["y"]), self.param_index[s["param_key"]], s["param_key"], s["type"], material_features
 
     def encode_input(self, node_type):
         return [1.0 if node_type == t else 0.0 for t in self.node_type_list]
@@ -147,17 +206,39 @@ class ParamDataset(Dataset):
 # ─────────────────────────────────────────────
 
 class MultiHeadParamPredictor(nn.Module):
-    def __init__(self, input_dim, param_keys, param_types, dropdown_classes, checkbox_classes):
+    def __init__(self, input_dim, param_keys, param_types, dropdown_classes, checkbox_classes, material_feature_dim=None):
         super().__init__()
-        self.shared = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-        )
+
+        # Material name context processing
+        self.has_material_context = material_feature_dim is not None
+
+        if self.has_material_context:
+            # Use a fixed intermediate dimension for material features
+            self.fixed_dim = 64
+            self.material_adapter = nn.Linear(1, self.fixed_dim)  # Will be resized dynamically
+            self.material_projection = nn.Linear(self.fixed_dim, 64)
+            self.material_attention = nn.Linear(64, 1)
+
+            # Shared network with material context
+            self.shared = nn.Sequential(
+                nn.Linear(input_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 64),
+                nn.ReLU(),
+            )
+        else:
+            # Original shared network without material context
+            self.shared = nn.Sequential(
+                nn.Linear(input_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 64),
+                nn.ReLU(),
+            )
 
         self.param_keys = param_keys
         self.param_types = param_types
+        self.dropdown_classes = dropdown_classes
+        self.checkbox_classes = checkbox_classes
 
         # Replace '.' with '__' for safe PyTorch keys
         self.key_map = {k: k.replace(".", "__") for k in param_keys}
@@ -180,8 +261,53 @@ class MultiHeadParamPredictor(nn.Module):
             elif param_type == "bin":
                 self.binary_heads[safe_key] = nn.Linear(64, 2)
 
-    def forward(self, x, param_keys):
+        # Save model metadata for later use
+        self.material_feature_dim = material_feature_dim
+
+        # Save metadata to file
+        import json
+        import os
+        metadata_path = os.path.join("/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Models/Parameters", "model_metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump({
+                "has_material_context": self.has_material_context,
+                "material_feature_dim": material_feature_dim
+            }, f)
+
+    def forward(self, x, param_keys, material_features=None):
+        # Process node type features
         shared = self.shared(x)
+
+        # Apply material context if available
+        if self.has_material_context and material_features is not None:
+            # Ensure material_features has at least 2 dimensions
+            if material_features.dim() == 1:
+                material_features = material_features.unsqueeze(0)
+
+            # Resize the adapter layer if needed
+            input_dim = material_features.size(1)
+            if self.material_adapter.in_features != input_dim:
+                # Create a new adapter layer with the correct input dimension
+                new_adapter = nn.Linear(input_dim, self.fixed_dim).to(material_features.device)
+                # Initialize with xavier uniform weights
+                nn.init.xavier_uniform_(new_adapter.weight)
+                self.material_adapter = new_adapter
+
+            # Apply the adapter followed by the projection
+            adapted_features = self.material_adapter(material_features)
+            material_embedding = self.material_projection(adapted_features)
+
+            # Apply attention mechanism
+            attention_scores = torch.matmul(shared, material_embedding.unsqueeze(-1)).squeeze(-1)
+            attention_weights = torch.softmax(attention_scores, dim=1).unsqueeze(-1)
+
+            # Apply attention and add material context
+            shared = shared * attention_weights + shared  # Residual connection
+
+            # Add material context directly
+            material_context = material_embedding.unsqueeze(1).expand(-1, shared.size(1), -1)
+            shared = shared + 0.1 * material_context  # Weighted addition
+
         outputs = []
 
         for i, key in enumerate(param_keys):
@@ -217,16 +343,25 @@ def train(model, dataloader, param_types, epochs=10, lr=1e-4):
 
     for epoch in range(epochs):
         total_loss = 0.0
-        for x, y, param_idx, param_key, param_type in dataloader:
-            preds = model(x, param_key)
+        for batch in dataloader:
+            # Check if material features are included in the batch
+            if len(batch) == 6:
+                x, y, param_idx, param_key, param_type, material_features = batch
+                preds = model(x, param_key, material_features)
+            else:
+                x, y, param_idx, param_key, param_type = batch
+                preds = model(x, param_key)
+
             losses = []
             for i in range(len(preds)):
                 if param_type[i] == "reg":
                     losses.append(loss_fn_reg(preds[i].squeeze(), y[i]))
                 elif param_type[i] == "cls":
-                    losses.append(loss_fn_cls(preds[i].unsqueeze(0), y[i].long().unsqueeze(0)))
+                    # Ensure predictions are 2D [batch_size, num_classes] and targets are 1D [batch_size]
+                    losses.append(loss_fn_cls(preds[i].unsqueeze(0), y[i].long()))
                 elif param_type[i] == "bin":
-                    losses.append(loss_fn_bin(preds[i].unsqueeze(0), y[i].long().unsqueeze(0)))
+                    # Ensure predictions are 2D [batch_size, num_classes] and targets are 1D [batch_size]
+                    losses.append(loss_fn_bin(preds[i].unsqueeze(0), y[i].long()))
             loss = sum(losses) / len(losses)
             optimizer.zero_grad()
             loss.backward()
@@ -251,17 +386,36 @@ def main():
     dataset = ParamDataset(JSON_PATH, param_ranges, dropdown_classes, checkbox_classes, node_type_to_params)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
+    # Get material feature dimension from the dataset
+    sample_data = dataset[0]
+    material_feature_dim = sample_data[5].size(0) if len(sample_data) > 5 else None
+
+    print(f"[+] Material feature dimension: {material_feature_dim}")
+
     model = MultiHeadParamPredictor(
         input_dim=len(dataset[0][0]),
         param_keys=dataset.param_keys,
         param_types=dataset.param_types,
         dropdown_classes=dropdown_classes,
-        checkbox_classes=checkbox_classes
+        checkbox_classes=checkbox_classes,
+        material_feature_dim=material_feature_dim
     )
 
     train(model, dataloader, dataset.param_types, epochs=10)
-    torch.save(model.state_dict(), MODEL_SAVE_PATH)
-    print(f"[+] Saved model to {MODEL_SAVE_PATH}")
+
+    # Save model with metadata
+    model_data = {
+        "model_state_dict": model.state_dict(),
+        "has_material_context": model.has_material_context,
+        "material_feature_dim": material_feature_dim,
+        "param_keys": dataset.param_keys,
+        "param_types": dataset.param_types,
+        "dropdown_classes": dropdown_classes,
+        "checkbox_classes": checkbox_classes
+    }
+
+    torch.save(model_data, MODEL_SAVE_PATH)
+    print(f"[+] Saved model with material context to {MODEL_SAVE_PATH}")
 
 if __name__ == "__main__":
     main()

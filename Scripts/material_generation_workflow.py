@@ -62,9 +62,9 @@ from torch_geometric.data import Data
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import functions from other scripts
-from Scripts.Nodes.node_autoregression import NodeGenerator
-from Scripts.Edges.gnn_edge_predictor import GNNModel, NUM_NODE_TYPES, NUM_SOCKET_TYPES
-from Scripts.Parameters.gnn_edge_and_param_predictor import compute_param_stats, ParamDataset, MultiHeadParamPredictor
+from Models.Nodes.node_autoregression import NodeGenerator
+from Models.Edges.gnn_edge_predictor import GNNModel, NUM_NODE_TYPES, NUM_SOCKET_TYPES
+from Models.Parameters.gnn_edge_and_param_predictor import compute_param_stats, ParamDataset, MultiHeadParamPredictor
 from Scripts.Textures.texture_generator import generate_textures
 
 def parse_arguments():
@@ -110,6 +110,12 @@ def parse_arguments():
     parser.add_argument("--material-name", default="Generated_Material",
                         help="Name of the material to create in Blender")
 
+    # Material context arguments
+    parser.add_argument("--use-material-context", action="store_true",
+                        help="Use material name as context for generation")
+    parser.add_argument("--material-prompt", default="",
+                        help="Prompt to use as material name context (if not provided, --material-name will be used)")
+
     # Texture generation arguments
     parser.add_argument("--generate-textures", action="store_true",
                         help="Generate textures for IMAGE TEX nodes")
@@ -117,7 +123,7 @@ def parse_arguments():
                         help="Prompt for texture generation")
     parser.add_argument("--texture-variants", type=int, default=1,
                         help="Number of texture variants to generate")
-    parser.add_argument("--texture-output-dir", default="./Scripts/Textures/generated_textures",
+    parser.add_argument("--texture-output-dir", default="/Volumes/Data/University/PPMGR/Blender_Mat_Generator_PPMGR/Scripts/Textures/generated_textures",
                         help="Directory to save generated textures")
 
     # Blender arguments
@@ -160,7 +166,41 @@ def predict_nodes(args):
     model.load_state_dict(state)
     model.to(device)
 
-    # generate
+    # Check if we should use material context
+    material_name = None
+    if args.use_material_context:
+        # Use material prompt if provided, otherwise use material name
+        material_name = args.material_prompt if args.material_prompt else args.material_name
+        print(f"Using material context: '{material_name}'")
+
+        # Check if material-aware model is available
+        material_model_path = os.path.join(os.path.dirname(args.model_in), "material_aware_model.pt")
+        if os.path.exists(material_model_path):
+            try:
+                # Import necessary modules
+                import pickle
+                import sys
+                sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                from Scripts.Nodes.transformer_node_model_upgrade import use_model as node_use_model
+
+                # Use the material-aware model for generation
+                print(f"Using material-aware node model with context: '{material_name}'")
+                best_sequence = node_use_model(start_sequence="", num_candidates=args.num_samples, material_name=material_name)
+
+                # Convert to list of node IDs if it's not already
+                if not isinstance(best_sequence, list):
+                    tokens = best_sequence.squeeze(1).tolist() if hasattr(best_sequence, 'squeeze') else best_sequence
+                    best_sequence = [t for t in tokens if 1<=t<=N]
+
+                names = [id2node[str(t)] for t in best_sequence]
+                print(f"\nGenerated sequence with material context: {' → '.join(names)}")
+
+                return best_sequence
+            except Exception as e:
+                print(f"Error using material-aware model: {e}")
+                print("Falling back to standard generation...")
+
+    # Standard generation without material context
     best_sequence = None
     for i in range(args.num_samples):
         seq = torch.tensor([[BOS_ID]], device=device)
@@ -266,7 +306,54 @@ def predict_edges(args, node_sequence):
 
     # Load model and predict
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    model = GNNModel(input_dim=NUM_NODE_TYPES, hidden_dim=64).to(device)
+
+    # Check if we should use material context
+    material_name = None
+    material_features = None
+    if args.use_material_context:
+        # Use material prompt if provided, otherwise use material name
+        material_name = args.material_prompt if args.material_prompt else args.material_name
+        print(f"Using material context for edge prediction: '{material_name}'")
+
+        # Check if material-aware model metadata is available
+        metadata_path = os.path.join(os.path.dirname(args.edge_model), "model_metadata.json")
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'r') as f:
+                    model_metadata = json.load(f)
+
+                if model_metadata.get("has_material_context"):
+                    # Load the vectorizer
+                    import pickle
+                    vectorizer_path = os.path.join(os.path.dirname(args.edge_model), "material_name_vectorizer.pkl")
+                    if os.path.exists(vectorizer_path):
+                        with open(vectorizer_path, 'rb') as f:
+                            vectorizer = pickle.load(f)
+
+                        # Process the material name
+                        material_features = vectorizer.transform([material_name])
+                        material_features = torch.tensor(material_features.toarray(), dtype=torch.float32).squeeze(0).to(device)
+
+                        # Add material features to the data
+                        data.material_features = material_features
+
+                        print(f"Added material context to edge prediction data")
+                    else:
+                        print(f"Material name vectorizer not found at {vectorizer_path}")
+                else:
+                    print("Edge model does not support material context")
+            except Exception as e:
+                print(f"Error loading material context for edge prediction: {e}")
+
+    # Load the appropriate model
+    if material_features is not None:
+        # Load material-aware model
+        material_feature_dim = material_features.size(0)
+        model = GNNModel(input_dim=NUM_NODE_TYPES, hidden_dim=64, material_feature_dim=material_feature_dim).to(device)
+    else:
+        # Load standard model
+        model = GNNModel(input_dim=NUM_NODE_TYPES, hidden_dim=64).to(device)
+
     model.load_state_dict(torch.load(args.edge_model, map_location=device))
     model.eval()
 
@@ -583,14 +670,82 @@ def predict_parameters(args, graph_data):
 
     # Load model
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    model = MultiHeadParamPredictor(
-        input_dim=len(dummy_dataset[0][0]),
-        param_keys=[encode_param_key(k) for k in dummy_dataset.param_keys],
-        param_types={encode_param_key(k): v for k, v in param_types.items()},
-        dropdown_classes={encode_param_key(k): v for k, v in dropdown_classes.items()},
-        checkbox_classes={encode_param_key(k): v for k, v in checkbox_classes.items()}
-    )
-    model.load_state_dict(torch.load(args.param_model, map_location=device))
+
+    # Check if we should use material context
+    material_name = None
+    material_features = None
+    material_feature_dim = None
+
+    if args.use_material_context:
+        # Use material prompt if provided, otherwise use material name
+        material_name = args.material_prompt if args.material_prompt else args.material_name
+        print(f"Using material context for parameter prediction: '{material_name}'")
+
+        # Check if the model was saved with metadata
+        try:
+            model_data = torch.load(args.param_model, map_location=device)
+
+            # Check if the model was saved with material context support
+            if isinstance(model_data, dict) and model_data.get("has_material_context"):
+                print("Loading parameter model with material context support")
+
+                # Load the vectorizer
+                import pickle
+                vectorizer_path = os.path.join(os.path.dirname(args.param_model), "material_name_vectorizer.pkl")
+                if os.path.exists(vectorizer_path):
+                    with open(vectorizer_path, 'rb') as f:
+                        vectorizer = pickle.load(f)
+
+                    # Process the material name
+                    material_features = vectorizer.transform([material_name])
+                    material_features = torch.tensor(material_features.toarray(), dtype=torch.float32).squeeze(0).to(device)
+                    material_feature_dim = material_features.size(0)
+
+                    print(f"Added material context to parameter prediction")
+                else:
+                    print(f"Material name vectorizer not found at {vectorizer_path}")
+            else:
+                print("Parameter model does not support material context")
+        except Exception as e:
+            print(f"Error loading material context for parameter prediction: {e}")
+
+    # Load the appropriate model
+    try:
+        model_data = torch.load(args.param_model, map_location=device)
+
+        if isinstance(model_data, dict) and "model_state_dict" in model_data:
+            # Model was saved with metadata
+            model = MultiHeadParamPredictor(
+                input_dim=len(dummy_dataset[0][0]),
+                param_keys=[encode_param_key(k) for k in dummy_dataset.param_keys],
+                param_types={encode_param_key(k): v for k, v in param_types.items()},
+                dropdown_classes={encode_param_key(k): v for k, v in dropdown_classes.items()},
+                checkbox_classes={encode_param_key(k): v for k, v in checkbox_classes.items()},
+                material_feature_dim=material_feature_dim
+            )
+            model.load_state_dict(model_data["model_state_dict"])
+        else:
+            # Legacy model without metadata
+            model = MultiHeadParamPredictor(
+                input_dim=len(dummy_dataset[0][0]),
+                param_keys=[encode_param_key(k) for k in dummy_dataset.param_keys],
+                param_types={encode_param_key(k): v for k, v in param_types.items()},
+                dropdown_classes={encode_param_key(k): v for k, v in dropdown_classes.items()},
+                checkbox_classes={encode_param_key(k): v for k, v in checkbox_classes.items()}
+            )
+            model.load_state_dict(model_data)
+    except Exception as e:
+        print(f"Error loading parameter model: {e}")
+        # Fallback to standard model loading
+        model = MultiHeadParamPredictor(
+            input_dim=len(dummy_dataset[0][0]),
+            param_keys=[encode_param_key(k) for k in dummy_dataset.param_keys],
+            param_types={encode_param_key(k): v for k, v in param_types.items()},
+            dropdown_classes={encode_param_key(k): v for k, v in dropdown_classes.items()},
+            checkbox_classes={encode_param_key(k): v for k, v in checkbox_classes.items()}
+        )
+        model.load_state_dict(torch.load(args.param_model, map_location=device))
+
     model.to(device).eval()
 
     # Predict parameters per node
@@ -606,40 +761,86 @@ def predict_parameters(args, graph_data):
         one_hot = [1.0 if t == node_type else 0.0 for t in dummy_dataset.node_type_list]
         x = torch.tensor(one_hot, dtype=torch.float32).unsqueeze(0).to(device)
 
-        shared = model.shared(x)
-        print(f"\nNode {idx} [{node_type}]:")
+        # Process with or without material context
+        if material_features is not None and hasattr(model, 'has_material_context') and model.has_material_context:
+            # Use material context for prediction
+            print(f"Using material context '{material_name}' for node {idx} [{node_type}]")
 
-        # Store parameters for this node
-        graph_data["parameters"][idx] = {"node_type": node_type, "params": {}}
+            # Forward pass with material features
+            param_keys = list(model.param_types.keys())
+            outputs = model(x, param_keys, material_features.unsqueeze(0))
 
-        for param in node_type_to_params.get(node_type, []):
-            if param in EXCLUDED_PARAMS:
-                continue
+            # Process outputs
+            print(f"\nNode {idx} [{node_type}] (with material context):")
 
-            encoded = encode_param_key(param)
-            head_type = model.param_types.get(encoded)
-            if not head_type:
-                continue
+            # Store parameters for this node
+            graph_data["parameters"][idx] = {"node_type": node_type, "params": {}}
 
-            if head_type == "reg" and encoded in model.regression_heads:
-                pred = model.regression_heads[encoded](shared).squeeze().item()
-                denorm = pred * (param_ranges[param][1] - param_ranges[param][0] + 1e-8) + param_ranges[param][0]
-                print(f"  {param:<20} = {denorm:.4f}")
-                graph_data["parameters"][idx]["params"][param] = denorm
+            for i, param_key in enumerate(param_keys):
+                # Skip if not relevant for this node type
+                original_key = model.reverse_key_map.get(param_key, param_key)
+                if original_key not in node_type_to_params.get(node_type, []) or original_key in EXCLUDED_PARAMS:
+                    continue
 
-            elif head_type == "cls" and encoded in model.classification_heads:
-                logits = model.classification_heads[encoded](shared).squeeze()
-                class_idx = torch.argmax(logits).item()
-                label = dropdown_classes[encoded][class_idx]
-                print(f"  {param:<20} = '{label}'")
-                graph_data["parameters"][idx]["params"][param] = label
+                param_type = model.param_types.get(param_key)
+                if not param_type:
+                    continue
 
-            elif head_type == "bin" and encoded in model.binary_heads:
-                logits = model.binary_heads[encoded](shared).squeeze()
-                class_idx = torch.argmax(logits).item()
-                label = model.checkbox_classes[encoded][class_idx]
-                print(f"  {param:<20} = {label}")
-                graph_data["parameters"][idx]["params"][param] = label
+                if param_type == "reg":
+                    pred = outputs[i].squeeze().item()
+                    denorm = pred * (param_ranges[original_key][1] - param_ranges[original_key][0] + 1e-8) + param_ranges[original_key][0]
+                    print(f"  {original_key:<20} = {denorm:.4f}")
+                    graph_data["parameters"][idx]["params"][original_key] = denorm
+
+                elif param_type == "cls":
+                    logits = outputs[i].squeeze()
+                    class_idx = torch.argmax(logits).item()
+                    label = dropdown_classes[param_key][class_idx]
+                    print(f"  {original_key:<20} = '{label}'")
+                    graph_data["parameters"][idx]["params"][original_key] = label
+
+                elif param_type == "bin":
+                    logits = outputs[i].squeeze()
+                    class_idx = torch.argmax(logits).item()
+                    label = model.checkbox_classes[param_key][class_idx]
+                    print(f"  {original_key:<20} = {label}")
+                    graph_data["parameters"][idx]["params"][original_key] = label
+        else:
+            # Standard prediction without material context
+            shared = model.shared(x)
+            print(f"\nNode {idx} [{node_type}]:")
+
+            # Store parameters for this node
+            graph_data["parameters"][idx] = {"node_type": node_type, "params": {}}
+
+            for param in node_type_to_params.get(node_type, []):
+                if param in EXCLUDED_PARAMS:
+                    continue
+
+                encoded = encode_param_key(param)
+                head_type = model.param_types.get(encoded)
+                if not head_type:
+                    continue
+
+                if head_type == "reg" and encoded in model.regression_heads:
+                    pred = model.regression_heads[encoded](shared).squeeze().item()
+                    denorm = pred * (param_ranges[param][1] - param_ranges[param][0] + 1e-8) + param_ranges[param][0]
+                    print(f"  {param:<20} = {denorm:.4f}")
+                    graph_data["parameters"][idx]["params"][param] = denorm
+
+                elif head_type == "cls" and encoded in model.classification_heads:
+                    logits = model.classification_heads[encoded](shared).squeeze()
+                    class_idx = torch.argmax(logits).item()
+                    label = dropdown_classes[encoded][class_idx]
+                    print(f"  {param:<20} = '{label}'")
+                    graph_data["parameters"][idx]["params"][param] = label
+
+                elif head_type == "bin" and encoded in model.binary_heads:
+                    logits = model.binary_heads[encoded](shared).squeeze()
+                    class_idx = torch.argmax(logits).item()
+                    label = model.checkbox_classes[encoded][class_idx]
+                    print(f"  {param:<20} = {label}")
+                    graph_data["parameters"][idx]["params"][param] = label
 
     # Save updated graph data with parameters
     with open(args.output_json, "w") as f:
@@ -745,6 +946,19 @@ def import_to_blender(args):
 def main():
     args = parse_arguments()
 
+    # Print material context information if enabled
+    if args.use_material_context:
+        material_name = args.material_prompt if args.material_prompt else args.material_name
+        print("\n" + "="*50)
+        print(f"USING MATERIAL CONTEXT: '{material_name}'")
+        print("="*50)
+        print("Material context will be used for node, edge, and parameter prediction if supported by the models.")
+
+        # If material prompt is not provided but texture prompt is, use it as material prompt
+        if not args.material_prompt and args.generate_textures and args.texture_prompt:
+            print(f"No specific material prompt provided, using texture prompt as material context: '{args.texture_prompt}'")
+            args.material_prompt = args.texture_prompt
+
     # Step 1: Predict nodes
     node_sequence = predict_nodes(args)
 
@@ -770,6 +984,9 @@ def main():
     print("WORKFLOW COMPLETED SUCCESSFULLY")
     print("="*50)
     print(f"Generated material graph saved to: {args.output_json}")
+    if args.use_material_context:
+        material_name = args.material_prompt if args.material_prompt else args.material_name
+        print(f"Material generated with context: '{material_name}'")
     if args.generate_textures:
         print(f"Textures generated and assigned to IMAGE TEX nodes")
     if not args.skip_blender:
