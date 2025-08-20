@@ -77,7 +77,18 @@ test_dump/saved_sequence.txt
 .DS_Store
 *.pth
 .DS_Store
+<<<<<<< Updated upstream
 *.tif
 /Projects
 /Models/Textures/minc
 /Models/Textures
+=======
+/Models/Textures/minc
+/Models/Textures/fmd
+/Models/Textures/MyTexturesDataset
+/Models/Textures/MyTexturesDataset_AutoK
+/Models/Textures/MyTexturesDataset_UMAP
+/Projects
+/Models/Textures/dtd
+/Models/Textures/PyTorch-Encoding
+>>>>>>> Stashed changes

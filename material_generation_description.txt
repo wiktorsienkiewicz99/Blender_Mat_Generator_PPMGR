@@ -1,0 +1,75 @@
+# Material Generation Workflow Description
+
+## Overall Workflow
+
+The material generation workflow in this project consists of several key steps:
+
+1. **Node Prediction**: Using a transformer-based model to predict a sequence of nodes that form the material graph.
+2. **Edge Prediction**: Using a Graph Neural Network (GNN) to predict connections between nodes.
+3. **Parameter Prediction**: Using another GNN to predict parameters for each node.
+4. **Texture Generation**: Optionally generating textures for IMAGE TEX nodes using Stable Diffusion.
+5. **Blender Import**: Importing the generated material into Blender.
+
+The workflow is orchestrated by the `material_generation_workflow.py` script, which calls specialized modules for each step.
+
+## Material Name Context Implementation
+
+Material name context is implemented across different models to influence the generation process:
+
+### In Node Prediction (MaterialAwareGPT)
+
+The `MaterialAwareGPT` class in `transformer_node_model_upgrade.py` extends a base GPT model to incorporate material name context:
+
+1. The material name is processed through a vectorizer to create a feature vector.
+2. This vector is passed through an adapter layer to match the expected dimension.
+3. The adapted features are projected to the model's hidden dimension.
+4. An attention mechanism is used to apply the material context to the hidden states.
+5. This enhances the model's predictions by making them aware of the desired material type.
+
+### In Edge Prediction
+
+The edge prediction model also supports material context:
+
+1. The material name is vectorized using the same approach.
+2. The GNN model includes a material adapter that processes these features.
+3. The material context influences which connections are predicted between nodes.
+
+### In Parameter Prediction
+
+Parameter prediction similarly incorporates material context:
+
+1. The material name is vectorized to create a feature vector.
+2. The MultiHeadParamPredictor model uses this context to predict appropriate parameters.
+3. This ensures parameters are consistent with the desired material type.
+
+## How Prompts Influence Material Generation
+
+Prompts influence the material generation process in two main ways:
+
+### Material Name as Context
+
+When the `--use-material-context` flag is set:
+
+1. The material name (or a specific material prompt) is used as context for all generation steps.
+2. This influences the types of nodes selected, their connections, and their parameters.
+3. The result is a material that better matches the described characteristics.
+
+### Texture Generation Prompts
+
+When texture generation is enabled (`--generate-textures`):
+
+1. The texture prompt guides the Stable Diffusion model to generate appropriate textures.
+2. The prompt directly influences what kind of texture is generated through the model:
+   ```python
+   image = pipe(prompt, guidance_scale=7.5).images[0]
+   ```
+3. CLIP is used to rank generated variants based on their similarity to the prompt:
+   ```python
+   inputs = clip_processor(text=prompt, images=image, return_tensors="pt", padding=True).to(device)
+   outputs = clip_model(**inputs)
+   similarity = outputs.logits_per_image.softmax(dim=1)[0][0].item()
+   ```
+4. The best-matching texture is then used to create various texture maps (base_color, roughness, metallic, normal).
+5. If no specific material prompt is provided but texture generation is enabled, the texture prompt can also be used as the material context.
+
+This dual-prompt system allows for fine-grained control over both the material structure and its textures, resulting in more coherent and contextually appropriate materials.
