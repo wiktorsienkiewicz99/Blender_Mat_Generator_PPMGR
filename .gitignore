@@ -77,3 +77,7 @@ test_dump/saved_sequence.txt
 .DS_Store
 *.pth
 .DS_Store
+*.tif
+/Projects
+/Models/Textures/minc
+/Models/Textures
