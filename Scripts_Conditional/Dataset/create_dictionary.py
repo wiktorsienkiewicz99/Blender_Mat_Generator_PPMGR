@@ -1,0 +1,48 @@
+import logging
+from config_loader import load_config
+
+config = load_config()
+
+dataset_refined_folder = config["dataset_refined_folder_path"]
+dataset_auxiliary_folder = config["dataset_auxiliary_folder_path"]
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+
+# Paths
+merged_dataset_path = dataset_refined_folder + "/merged_dataset.json"
+node_to_id_path = dataset_auxiliary_folder + "/node_to_id.json"
+id_to_node_path = dataset_auxiliary_folder + "/id_to_node.json"
+
+def generate_node_to_id(input_file, node_to_id_file, id_to_node_file):
+    logging.info("Loading training data...")
+    with open(input_file, "r") as file:
+        raw_data = json.load(file)
+
+    logging.info("Extracting unique node types...")
+    node_types = set()
+
+    for material_name, material_data in raw_data.get("materials", {}).items():
+        for node in material_data.get("nodes", []):
+            if "type" in node:
+                node_types.add(node["type"])
+
+    # Create node-to-ID and ID-to-node mappings
+    node_to_id = {node_type: idx for idx, node_type in enumerate(sorted(node_types))}  # Start ID
+    id_to_node = {v: k for k, v in node_to_id.items()}
+
+    # Save mappings to JSON files
+    logging.info(f"Saving node-to-ID mapping to '{node_to_id_file}'...")
+    with open(node_to_id_file, "w") as file:
+        json.dump(node_to_id, file, indent=4)
+
+    logging.info(f"Saving ID-to-node mapping to '{id_to_node_file}'...")
+    with open(id_to_node_file, "w") as file:
+        json.dump(id_to_node, file, indent=4)
+
+    logging.info("Mappings generated successfully!")
+    return node_to_id, id_to_node
+
+# Run the script
+if __name__ == "__main__":
+    generate_node_to_id(merged_dataset_path, node_to_id_path, id_to_node_path)
